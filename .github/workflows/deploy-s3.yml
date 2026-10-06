@@ -6,6 +6,10 @@ name: Deploy KlinSync Backend (S3)
 #   scripts/                                         scripts de operação das EC2
 # A EC2 puxa a release do S3 com `sudo klinsync-deploy` (ou o deploy manual abaixo).
 #
+# Versionamento: cada publicação recebe uma versão semântica (vX.Y.Z), gravada na release do S3 e numa tag +
+# GitHub Release. O bucket é um espelho do repositório: scripts/ é sincronizado com --delete e só as últimas
+# 20 releases são mantidas (o versionamento do bucket permite recuperar o que foi removido).
+#
 # Mesmo padrão do tf-vpc: ambiente develop + role vinda do secret AWS_ROLE_ARN_DEVELOP (OIDC).
 #
 # Secrets (Settings > Environments > develop):
@@ -17,13 +21,18 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      bump:
+        description: "Incremento da versão semântica. 'auto' (padrão) decide pelos commits: feat! / BREAKING CHANGE = major, feat = minor, demais = patch"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
       deploy_ec2:
         description: "Depois de publicar, rodar o deploy na EC2 via SSM (precisa do secret EC2_INSTANCE_ID)"
         type: boolean
         default: false
 
 permissions:
-  contents: read
+  contents: write   # criar tags e GitHub Releases
   id-token: write
 
 concurrency:
@@ -42,6 +51,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0   # necessário para ler as tags de versão
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Testes
+        run: npm test
+
+      - name: Build
+        run: npm run build
 
       - name: Validar role da AWS
         env:
@@ -65,7 +94,46 @@ jobs:
         run: |
           for f in scripts/*.sh; do bash -n "$f"; done
 
+      - name: Calcular versão (semver)
+        id: version
+        env:
+          BUMP: ${{ inputs.bump || 'auto' }}
+        run: |
+          git fetch --tags --force --quiet
+          EXACT="$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)"
+          if [ -n "$EXACT" ]; then
+            VERSION="${EXACT#v}"
+            echo "Commit já marcado como $EXACT; reutilizando a versão."
+          else
+            LAST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)"
+            if [ -z "$LAST" ]; then
+              VERSION="0.1.0"
+            else
+              IFS=. read -r MA MI PA <<< "${LAST#v}"
+              if [ "$BUMP" = "auto" ]; then
+                # Conventional Commits desde a última tag: "feat!:" ou BREAKING CHANGE -> major; "feat:" -> minor; resto -> patch
+                MSGS="$(git log --format=%B "$LAST"..HEAD)"
+                if grep -Eq '^(BREAKING[ -]CHANGE|[a-z]+(\([^)]*\))?!:)' <<< "$MSGS"; then BUMP=major
+                elif grep -Eq '^feat(\([^)]*\))?:' <<< "$MSGS"; then BUMP=minor
+                else BUMP=patch
+                fi
+                echo "Incremento detectado pelos commits: $BUMP"
+              fi
+              case "$BUMP" in
+                major) MA=$((MA + 1)); MI=0; PA=0 ;;
+                minor) MI=$((MI + 1)); PA=0 ;;
+                *) PA=$((PA + 1)) ;;
+              esac
+              VERSION="$MA.$MI.$PA"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versão desta publicação: v$VERSION"
+
       - name: Publicar no S3
+        id: publish
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: bash scripts/publish.sh
 
       - name: Deploy na EC2 (SSM)
@@ -82,3 +150,15 @@ jobs:
           STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" --query Status --output text)
           aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" --query StandardOutputContent --output text
           [ "$STATUS" = "Success" ] || { echo "❌ Deploy na EC2 falhou ($STATUS)"; exit 1; }
+
+      - name: Criar tag e GitHub Release
+        if: steps.publish.outputs.published == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "A release v$VERSION já existe."
+            exit 0
+          fi
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes

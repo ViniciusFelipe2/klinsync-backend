@@ -20,6 +20,17 @@ s3://klinsync-backend/
   scripts/                                         cópia destes scripts (usada no 1º setup)
 ```
 
+## Versionamento e espelho do GitHub no S3
+
+- **Versão semântica 100% automática:** a cada push na `main` o workflow lê as mensagens dos commits desde a última tag (padrão *Conventional Commits*) e decide o incremento:
+  `feat!:` ou `BREAKING CHANGE` → **major**, `feat:` → **minor**, qualquer outro (`fix:`, `docs:`, `chore:`...) → **patch**. Depois cria a tag `vX.Y.Z` e a **GitHub Release** com notas automáticas
+  (a primeira publicação é `v0.1.0`). Nenhuma ação manual é necessária; no disparo manual (Actions → Run workflow) dá para forçar `patch`/`minor`/`major`.
+  Reexecutar o workflow no mesmo commit reaproveita a versão já criada.
+- **Histórico no bucket:** o versionamento do S3 está ligado em `klinsync-backend`; versões antigas e arquivos removidos ficam recuperáveis por **90 dias**
+  (regra de lifecycle `klinsync-expire-noncurrent-versions`). Para restaurar: `aws s3api list-object-versions --bucket klinsync-backend --prefix <chave>`.
+- **Espelho:** `scripts/` é sincronizado com `--delete` (o que sai do repositório sai do bucket) e o código vai como release `releases/klinsync-backend-v<versão>-<data>-<sha>.tar.gz`
+  (metadados `version`, `commit`, `run`). Só as **20 últimas releases** ficam no bucket (`KEEP_RELEASES_S3`); `latest.txt` sempre aponta para a mais nova.
+
 ## Primeira vez
 
 1. **IAM da EC2** — instance profile com `AmazonSSMManagedInstanceCore` e a policy inline abaixo.

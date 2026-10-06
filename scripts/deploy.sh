@@ -45,7 +45,7 @@ chown -R "$APP_USER:$APP_USER" "$REL"
 
 log "Instalando dependências e compilando"
 export APP_CWD="$REL"
-if [ -f package-lock.json ]; then as_app npm ci --no-audit --no-fund; else as_app npm install --no-audit --no-fund; fi
+if [ -f "$REL/package-lock.json" ]; then as_app npm ci --no-audit --no-fund; else as_app npm install --no-audit --no-fund; fi
 as_app env NODE_OPTIONS="--max-old-space-size=${BUILD_HEAP_MB:-1024}" npm run build --if-present
 as_app npm prune --omit=dev --no-audit --no-fund
 unset APP_CWD
