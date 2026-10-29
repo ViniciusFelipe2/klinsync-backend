@@ -146,7 +146,7 @@ describe("check-in de cirurgiões", () => {
       const t = await criarHospital(env.db);
       const f = await habilitarFeature(env.db, t, "checkin_cirurgioes");
       await criarUsuarioDireto(env.db, { email: "o@t.com", role: "operador", tenantId: t, featureId: f });
-      const app = await buildApp({ config: env.config, db: env.db, externos: externosDeTeste(), storage: storageIndisponivel() });
+      const app = await buildApp({ config: env.config, db: env.db, externos: externosDeTeste(), storage: storageIndisponivel(), monitor: (await import("../src/services/monitor.js")).criarMonitorDemo(), eventos: new (await import("../src/lib/eventos.js")).BarramentoEventos(env.db) });
       await app.ready();
       const tok = await tokenDe(app, "o@t.com");
       const r = await chamar(app, "POST", "/checkins", { token: tok, body: { doctorName: "Dr. Sem Bucket", photoBase64: fotoPng() } });

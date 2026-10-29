@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { Deps } from "../deps.js";
-import { HttpError, notFound } from "../errors.js";
+import { HttpError, forbidden, notFound } from "../errors.js";
 import { limitarTentativas } from "../lib/limites.js";
-import { escopoTenant, exigirTenant } from "../lib/perfil.js";
+import { exigirModulo } from "../lib/modulo.js";
 import { Where, dataValida, escaparLike, limitesDoPeriodo } from "../lib/sql.js";
 
+const CHAVE = "checkin_cirurgioes" as const;
 const DEFAULT_DISK_GB = 1; // tamanho do disco contratado exibido na barra de uso
 
 const createSchema = z.object({
@@ -21,9 +22,9 @@ const idSchema = z.object({ id: z.string().uuid() });
 const idsSchema = z.object({ ids: z.array(z.string().uuid()).min(1).max(5000) });
 
 const filtroSchema = z.object({
-  busca: z.string().optional(),
-  de: z.string().optional(),
-  ate: z.string().optional(),
+  busca: z.string().max(120).optional(),
+  de: z.string().max(10).optional(),
+  ate: z.string().max(10).optional(),
 });
 
 /** Confere se os bytes realmente são do tipo de imagem declarado (evita enviar outro conteúdo como "foto"). */
@@ -39,13 +40,20 @@ export const checkinsRoutes =
   async (app) => {
     const tz = config.APP_TIMEZONE;
 
+    /** Perfil vinculado a um hospital (master não tem) com o módulo de check-in liberado. */
+    const tenantDoModulo = async (userId: string) => {
+      const { perfil, tenantId } = await exigirModulo(db, userId, CHAVE);
+      if (!tenantId) throw forbidden("Acesso não autorizado.");
+      return { ...perfil, tenant_id: tenantId };
+    };
+
     app.post("/checkins", async (req) => {
       const ip = req.ip || "desconhecido";
       // O limite vale antes de qualquer validação (inclui requisições inválidas em massa).
       // Vários médicos compartilham o IP do hospital e chegam em lotes: janela folgada para picos legítimos.
       await limitarTentativas(db, `checkin:${ip}`, 60, 60_000);
       const d = createSchema.parse(req.body);
-      const perfil = await exigirTenant(db, req.auth.userId);
+      const perfil = await tenantDoModulo(req.auth.userId);
 
       const [meta, b64] = d.photoBase64.split(",") as [string, string];
       const tipo = meta.slice(11, meta.indexOf(";")); // data:image/<tipo>;base64
@@ -69,7 +77,7 @@ export const checkinsRoutes =
 
     app.post("/checkins/foto-url", async (req) => {
       const { id } = idSchema.parse(req.body);
-      const perfil = await exigirTenant(db, req.auth.userId);
+      const perfil = await tenantDoModulo(req.auth.userId);
       const row = (await db.query<{ photo_path: string }>("SELECT photo_path FROM check_ins WHERE id = $1 AND tenant_id = $2", [id, perfil.tenant_id]))
         .rows[0];
       if (!row) throw notFound();
@@ -78,7 +86,7 @@ export const checkinsRoutes =
 
     app.post("/checkins/fotos-urls", async (req) => {
       const { ids } = idsSchema.parse(req.body);
-      const perfil = await exigirTenant(db, req.auth.userId);
+      const perfil = await tenantDoModulo(req.auth.userId);
       const rows = (
         await db.query<{ id: string; photo_path: string }>(
           "SELECT id, photo_path FROM check_ins WHERE tenant_id = $1 AND id = ANY($2::uuid[])",
@@ -99,7 +107,7 @@ export const checkinsRoutes =
 
     app.post("/checkins/excluir", async (req) => {
       const { id } = idSchema.parse(req.body);
-      const perfil = await exigirTenant(db, req.auth.userId);
+      const perfil = await tenantDoModulo(req.auth.userId);
       const r = await db.query<{ photo_path: string }>(
         "DELETE FROM check_ins WHERE id = $1 AND tenant_id = $2 RETURNING photo_path",
         [id, perfil.tenant_id],
@@ -111,7 +119,7 @@ export const checkinsRoutes =
     });
 
     app.post("/checkins/uso", async (req) => {
-      const perfil = await exigirTenant(db, req.auth.userId);
+      const perfil = await tenantDoModulo(req.auth.userId);
       const uso = await storage.usage(perfil.tenant_id);
       return {
         usedBytes: uso.bytes,
@@ -123,7 +131,7 @@ export const checkinsRoutes =
 
     /** Filtros comuns do painel e da exportação (master vê todos os hospitais). */
     const montarFiltro = async (userId: string, f: z.infer<typeof filtroSchema>) => {
-      const { tenantId } = await escopoTenant(db, userId);
+      const { tenantId } = await exigirModulo(db, userId, CHAVE);
       const w = new Where();
       if (tenantId) w.add("tenant_id = ?", tenantId);
       if (f.busca?.trim()) w.add("doctor_name ILIKE ?", `%${escaparLike(f.busca.trim())}%`);

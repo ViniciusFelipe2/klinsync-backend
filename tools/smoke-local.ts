@@ -91,7 +91,10 @@ console.log("\nGiro de sala (operador)");
 const salas = (await chamar("GET", "/giro/salas", { token: giro })).body as { id: string; nome: string; status_atual: string }[];
 conferir("lista as 3 salas ativas", salas.length === 3);
 const sala = salas.find((s) => s.status_atual === "livre")!;
-const iniciar = (tipo: string) => chamar("POST", "/giro/etapas/iniciar", { token: giro, body: { salaId: sala.id, tipo } });
+const TABLET = "smoke-tablet";
+conferir("vincula a sala ao tablet", (await chamar("POST", "/giro/reservas/reservar", { token: giro, body: { salaId: sala.id, deviceId: TABLET } })).body.reservada === true);
+conferir("outro tablet não opera a sala (403)", (await chamar("POST", "/giro/etapas/iniciar", { token: giro, body: { salaId: sala.id, tipo: "desmontagem", deviceId: "tablet-intruso" } })).status === 403);
+const iniciar = (tipo: string) => chamar("POST", "/giro/etapas/iniciar", { token: giro, body: { salaId: sala.id, tipo, deviceId: TABLET } });
 conferir("inicia enfermagem", (await iniciar("desmontagem")).status === 200);
 conferir("limpeza inicia dentro do ciclo", (await iniciar("limpeza")).status === 200);
 let abertos = (await chamar("GET", "/giro/eventos?abertos=true", { token: giro })).body as { id: string; tipo_evento: string }[];
@@ -99,22 +102,22 @@ const idEnf = abertos.find((e) => e.tipo_evento === "desmontagem")!.id;
 const idLimp = abertos.find((e) => e.tipo_evento === "limpeza")!.id;
 conferir(
   "enfermagem não fecha com a limpeza aberta (422)",
-  (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idEnf, cirurgiaProxima: "Cirurgia B" } })).status === 422,
+  (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idEnf, deviceId: TABLET, cirurgiaProxima: "Cirurgia B" } })).status === 422,
 );
-conferir("finaliza a limpeza", (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idLimp } })).status === 200);
+conferir("finaliza a limpeza", (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idLimp, deviceId: TABLET } })).status === 200);
 conferir(
   "finaliza a enfermagem com a próxima cirurgia",
-  (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idEnf, cirurgiaProxima: "Cirurgia B" } })).status === 200,
+  (await chamar("POST", "/giro/etapas/finalizar", { token: giro, body: { eventoId: idEnf, deviceId: TABLET, cirurgiaProxima: "Cirurgia B" } })).status === 200,
 );
 const depois = ((await chamar("GET", "/giro/salas", { token: giro })).body as { id: string; status_atual: string; cirurgia_atual: string }[]).find((s) => s.id === sala.id)!;
 conferir("sala volta a livre com a próxima cirurgia", depois.status_atual === "livre" && depois.cirurgia_atual === "Cirurgia B", JSON.stringify(depois));
 abertos = (await chamar("GET", "/giro/eventos?abertos=true", { token: giro })).body;
 conferir("nenhuma etapa em aberto", abertos.length === 0);
-const par = await chamar("POST", "/giro/paradas/iniciar", { token: giro, body: { salaId: sala.id } });
+const par = await chamar("POST", "/giro/paradas/iniciar", { token: giro, body: { salaId: sala.id, deviceId: TABLET } });
 const aberta = (await chamar("GET", "/giro/paradas?abertas=true", { token: giro })).body as { id: string }[];
-conferir("marca e libera sala parada", par.status === 200 && (await chamar("POST", "/giro/paradas/finalizar", { token: giro, body: { paradaId: aberta[0]!.id } })).status === 200);
-const reserva = await chamar("POST", "/giro/reservas/reservar", { token: giro, body: { salaId: sala.id, deviceId: "smoke-tablet" } });
-const liberou = await chamar("POST", "/giro/reservas/liberar", { token: giro, body: { salaId: sala.id, deviceId: "smoke-tablet" } });
+conferir("marca e libera sala parada", par.status === 200 && (await chamar("POST", "/giro/paradas/finalizar", { token: giro, body: { paradaId: aberta[0]!.id, deviceId: TABLET } })).status === 200);
+const reserva = await chamar("POST", "/giro/reservas/reservar", { token: giro, body: { salaId: sala.id, deviceId: TABLET } });
+const liberou = await chamar("POST", "/giro/reservas/liberar", { token: giro, body: { salaId: sala.id, deviceId: TABLET } });
 conferir("vínculo sala e tablet", reserva.body.reservada === true && liberou.status === 200);
 
 console.log("\nCheck-in de cirurgiões");

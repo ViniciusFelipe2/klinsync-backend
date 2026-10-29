@@ -18,6 +18,12 @@ const schema = z.object({
     .min(1, "DATABASE_URL não configurada")
     .refine((v) => /^postgres(ql)?:\/\//.test(v), "DATABASE_URL inválida (esperado postgresql://...)"),
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+  /**
+   * TLS na conexão com o Postgres. "disable" (padrão, desenvolvimento/rede local), "require" (cifra; o servidor da VPC usa
+   * certificado autoassinado) ou "verify" (cifra e valida o certificado; use DB_SSL_CA se a CA não for pública).
+   */
+  DB_SSL: z.enum(["disable", "require", "verify"]).default("disable"),
+  DB_SSL_CA: z.preprocess(vazioParaUndefined, z.string().optional()),
   JWT_ACCESS_SECRET: z.string().min(32, "JWT_ACCESS_SECRET precisa ter ao menos 32 caracteres"),
   JWT_REFRESH_SECRET: z.string().min(32, "JWT_REFRESH_SECRET precisa ter ao menos 32 caracteres"),
   MFA_ENCRYPTION_KEY: z.preprocess(vazioParaUndefined, z.string().min(32).optional()),
@@ -40,14 +46,30 @@ const schema = z.object({
     }, "APP_TIMEZONE inválido"),
   GEOIP_ENABLED: bool(true),
   HIBP_ENABLED: bool(true),
+  /** "aws" lê EC2/CloudWatch/Cost Explorer; "demo" usa dados fictícios (só fora de produção). */
+  MONITOR_MODO: z.enum(["aws", "demo"]).default("aws"),
+  /** Só as instâncias cuja tag Name começa com este prefixo entram no painel. */
+  MONITOR_NOME_PREFIXO: z.string().default("Klinsync"),
+  /** Orçamento mensal (USD) para o alerta de custo. Vazio = sem alerta de orçamento. */
+  ORCAMENTO_MENSAL_USD: z.preprocess(vazioParaUndefined, z.coerce.number().positive().optional()),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
+
+const schemaFinal = schema
+  .refine((c) => !(c.MONITOR_MODO === "demo" && c.NODE_ENV === "production"), {
+    path: ["MONITOR_MODO"],
+    message: "o modo demo (dados fictícios) não pode ser usado em produção",
+  })
+  .refine((c) => !c.CORS_ORIGIN.split(",").some((o) => o.trim() === "*"), {
+    path: ["CORS_ORIGIN"],
+    message: "'*' não é permitido: liste as origens exatas (a API usa Authorization)",
+  });
 
 export type Config = z.infer<typeof schema>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // Mapa próprio: o mapa global (mensagens da API) esconderia qual variável está faltando.
-  const r = schema.safeParse(env, {
+  const r = schemaFinal.safeParse(env, {
     errorMap: (issue, ctx) =>
       issue.code === "invalid_type" && issue.received === "undefined"
         ? { message: "variável não definida" }

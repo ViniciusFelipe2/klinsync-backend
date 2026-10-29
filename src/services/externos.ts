@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Config } from "../config.js";
+import { origensCors, type Config } from "../config.js";
 
 /* ----------------------------------- reCAPTCHA v3 ----------------------------------- */
 
@@ -10,6 +10,7 @@ export async function verificarCaptchaGoogle(
   secret: string | undefined,
   token: string | null | undefined,
   acaoEsperada: string,
+  hostnamesPermitidos: string[] = [],
 ): Promise<ResultadoCaptcha> {
   if (!secret) return { ok: true, motivo: "desativado" };
   if (!token) return { ok: false, motivo: "sem-token" };
@@ -21,8 +22,12 @@ export async function verificarCaptchaGoogle(
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) return { ok: true, motivo: "indisponivel" };
-    const corpo = (await resp.json()) as { success?: boolean; score?: number; action?: string };
+    const corpo = (await resp.json()) as { success?: boolean; score?: number; action?: string; hostname?: string };
     if (!corpo.success) return { ok: false, motivo: "invalido" };
+    // O token precisa ter sido emitido para o nosso site (um token gerado em outro domínio não vale).
+    if (hostnamesPermitidos.length > 0 && !(corpo.hostname && hostnamesPermitidos.includes(corpo.hostname))) {
+      return { ok: false, motivo: "hostname" };
+    }
     if (corpo.action && corpo.action !== acaoEsperada) return { ok: false, motivo: "acao" };
     const score = corpo.score ?? 0;
     if (score < SCORE_MINIMO) return { ok: false, motivo: "score-baixo", score };
@@ -94,8 +99,16 @@ export interface Externos {
 }
 
 export function criarExternos(config: Config): Externos {
+  // Hostnames do front (a partir das origens do CORS). localhost só passa se estiver na lista, ou seja, em desenvolvimento.
+  const hostnames = origensCors(config).flatMap((o) => {
+    try {
+      return [new URL(o).hostname];
+    } catch {
+      return [];
+    }
+  });
   return {
-    verificarCaptcha: (token, acao) => verificarCaptchaGoogle(config.RECAPTCHA_SECRET_KEY, token, acao),
+    verificarCaptcha: (token, acao) => verificarCaptchaGoogle(config.RECAPTCHA_SECRET_KEY, token, acao, hostnames),
     senhaFoiVazada: (senha) => (config.HIBP_ENABLED ? senhaFoiVazadaHibp(senha) : Promise.resolve(false)),
     geolocalizarIp: (ip) => (config.GEOIP_ENABLED ? geolocalizarIpExterno(ip) : Promise.resolve(null)),
   };

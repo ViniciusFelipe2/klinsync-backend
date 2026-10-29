@@ -2,12 +2,20 @@ import { buildApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { createPgDb } from "./db/index.js";
 import { criarExternos } from "./services/externos.js";
+import { BarramentoEventos } from "./lib/eventos.js";
+import { ColetorMetricas } from "./lib/metricas-api.js";
+import { criarMonitorAws, criarMonitorDemo } from "./services/monitor.js";
 import { criarStorageS3 } from "./services/storage.js";
 
 async function main() {
   const config = loadConfig();
-  const db = createPgDb({ connectionString: config.DATABASE_URL, max: config.DB_POOL_MAX });
-  const app = await buildApp({ config, db, externos: criarExternos(config), storage: criarStorageS3(config) });
+  const db = createPgDb({ connectionString: config.DATABASE_URL, max: config.DB_POOL_MAX, ssl: { modo: config.DB_SSL, ca: config.DB_SSL_CA } });
+  const eventos = new BarramentoEventos(db);
+  await eventos.iniciar();
+  const metricas = new ColetorMetricas(db);
+  metricas.iniciar();
+  const monitor = config.MONITOR_MODO === "demo" ? criarMonitorDemo() : criarMonitorAws(config);
+  const app = await buildApp({ config, db, externos: criarExternos(config), storage: criarStorageS3(config), monitor, metricas, eventos });
 
   let encerrando = false;
   const encerrar = async (sinal: string) => {

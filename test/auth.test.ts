@@ -82,18 +82,38 @@ describe("login, sessão e refresh", () => {
     expect((await login(amb.app, "off@trizion.com")).status).toBe(401);
   });
 
-  it("refresh rotaciona o token e o reuso do token antigo derruba a família", async () => {
+  it("refresh rotaciona o token; reuso fora da tolerância derruba a família", async () => {
     await criarUsuarioDireto(amb.db, { email: "rot@trizion.com", role: "master_admin" });
     const s1 = (await login(amb.app, "rot@trizion.com")).body;
     const s2 = await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s1.refreshToken } });
     expect(s2.status).toBe(200);
     expect(s2.body.refreshToken).not.toBe(s1.refreshToken);
 
-    // reuso do refresh antigo = possível roubo: invalida também o token novo
+    // passada a janela de tolerância, o reuso do refresh antigo = possível roubo: invalida também o token novo
+    await amb.db.query("UPDATE refresh_tokens SET rotacionado_em = now() - interval '5 minutes' WHERE rotacionado_em IS NOT NULL");
     const reuso = await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s1.refreshToken } });
     expect(reuso.status).toBe(401);
     const novo = await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s2.body.refreshToken } });
     expect(novo.status).toBe(401);
+  });
+
+  it("resposta de renovação perdida na rede: reapresentar o token logo em seguida não derruba a sessão", async () => {
+    await criarUsuarioDireto(amb.db, { email: "rede@trizion.com", role: "master_admin" });
+    const s1 = (await login(amb.app, "rede@trizion.com")).body;
+    const s2 = await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s1.refreshToken } });
+    expect(s2.status).toBe(200); // o cliente nunca recebeu esta resposta
+    const retry = await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s1.refreshToken } });
+    expect(retry.status).toBe(200);
+    expect((await chamar(amb.app, "GET", "/auth/me", { token: retry.body.accessToken })).status).toBe(200);
+    // o par que o cliente guardou da segunda resposta continua renovando
+    expect((await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: retry.body.refreshToken } })).status).toBe(200);
+  });
+
+  it("token revogado por logout não ganha tolerância", async () => {
+    await criarUsuarioDireto(amb.db, { email: "lo@trizion.com", role: "master_admin" });
+    const s1 = (await login(amb.app, "lo@trizion.com")).body;
+    await chamar(amb.app, "POST", "/auth/logout", { body: { refreshToken: s1.refreshToken } });
+    expect((await chamar(amb.app, "POST", "/auth/refresh", { body: { refreshToken: s1.refreshToken } })).status).toBe(401);
   });
 
   it("logout revoga o refresh token (204)", async () => {
@@ -193,8 +213,18 @@ describe("MFA (TOTP)", () => {
     const denovo = await chamar(amb.app, "POST", "/auth/mfa/verify", { body: { mfaToken, factorId, code: proximo } });
     expect(denovo.status).toBe(401);
 
-    // remover o fator volta ao login simples
-    expect((await chamar(amb.app, "DELETE", `/auth/mfa/factors/${id}`, { token: ok.body.accessToken })).status).toBe(200);
+    // com o MFA ativo, mexer nele exige o código atual (um access token roubado não basta)
+    const novoToken = ok.body.accessToken as string;
+    await amb.db.query("UPDATE mfa_fatores SET ultimo_passo = 0 WHERE id = $1", [id]); // o teste não espera os 30 s do passo
+    const remover = (code?: string) =>
+      chamar(amb.app, "POST", "/auth/mfa/factors/remover", { token: novoToken, body: { factorId: id, ...(code ? { code } : {}) } });
+    expect((await remover()).status).toBe(401);
+    expect((await remover("000000")).status).toBe(401);
+    expect((await chamar(amb.app, "POST", "/auth/mfa/enroll", { token: novoToken, body: {} })).status).toBe(401);
+    expect((await chamar(amb.app, "GET", "/auth/mfa/factors", { token: novoToken })).body).toHaveLength(1);
+
+    // com o código correto, remover volta ao login simples
+    expect((await remover(totp(secret).generate())).status).toBe(200);
     expect((await login(amb.app, "mfa@trizion.com")).body.accessToken).toBeTruthy();
   });
 

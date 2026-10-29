@@ -37,7 +37,7 @@ async function main() {
   });
   const log = (m: string) => console.log(m);
   const config = loadConfig();
-  const destino = createPgDb({ connectionString: config.DATABASE_URL, max: 4 });
+  const destino = createPgDb({ connectionString: config.DATABASE_URL, max: 4, ssl: { modo: config.DB_SSL, ca: config.DB_SSL_CA } });
   let fecharOrigem: (() => Promise<void>) | undefined;
 
   try {

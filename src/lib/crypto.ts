@@ -26,9 +26,11 @@ export function gerarTokenConvite(): string {
 
 /* ---------------------------------- Senhas (scrypt) ---------------------------------- */
 
-const N = 16384;
+// OWASP (Password Storage Cheat Sheet): scrypt com N=2^15 (32 MiB), r=8, p=3 é uma das combinações equivalentes recomendadas.
+// Os parâmetros vão dentro do hash, então dá para endurecer depois: hashes mais fracos são regravados no próximo login.
+const N = 32768;
 const R = 8;
-const P = 1;
+const P = 3;
 const KEYLEN = 64;
 
 function scryptAsync(senha: string, salt: Buffer, n: number, r: number, p: number): Promise<Buffer> {
@@ -47,6 +49,14 @@ export async function hashSenha(senha: string): Promise<string> {
 
 /** Hash bcrypt (formato do Supabase Auth), aceito só para migração: é convertido para scrypt no primeiro login. */
 export const ehHashLegado = (armazenado: string) => /^\$2[aby]\$\d{2}\$/.test(armazenado);
+
+/** Hash que deve ser regravado no login: bcrypt (migração do Supabase) ou scrypt com parâmetros abaixo dos atuais. */
+export function hashPrecisaAtualizar(armazenado: string): boolean {
+  if (ehHashLegado(armazenado)) return true;
+  const partes = armazenado.split("$");
+  if (partes.length !== 6 || partes[0] !== "scrypt") return false;
+  return Number(partes[1]) < N || Number(partes[2]) < R || Number(partes[3]) < P;
+}
 
 export async function verificarSenha(senha: string, armazenado: string): Promise<boolean> {
   if (ehHashLegado(armazenado)) return bcrypt.compare(senha, armazenado).catch(() => false);

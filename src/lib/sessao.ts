@@ -15,6 +15,9 @@ export type SessaoResposta = {
 
 type Origem = { ip: string; userAgent: string | null };
 
+/** Janela em que um token acabado de ser trocado ainda é aceito uma segunda vez. */
+const TOLERANCIA_ROTACAO_S = 30;
+
 const hashRefresh = (config: Config, token: string) => sha256Hex(`${config.JWT_REFRESH_SECRET}:${token}`);
 
 async function gravarRefresh(
@@ -58,20 +61,28 @@ export async function renovarSessao(db: Db, config: Config, refreshToken: string
     familia: string;
     expirado: boolean;
     revogado: boolean;
+    recemRotacionado: boolean;
     email: string;
     ativo: boolean | null;
   }>(
     `SELECT t.id, t.usuario_id, t.familia, (t.expira_em < now()) AS expirado,
-            (t.revogado_em IS NOT NULL) AS revogado, u.email, p.ativo
+            (t.revogado_em IS NOT NULL) AS revogado,
+            (t.rotacionado_em IS NOT NULL AND t.rotacionado_em > now() - make_interval(secs => $2::int)) AS "recemRotacionado",
+            u.email, p.ativo
        FROM refresh_tokens t
        JOIN usuarios u ON u.id = t.usuario_id
        LEFT JOIN usuarios_perfil p ON p.id = t.usuario_id
       WHERE t.token_hash = $1`,
-    [hash],
+    [hash, TOLERANCIA_ROTACAO_S],
   );
   const t = r.rows[0];
   if (!t) throw unauthorized();
 
+  // Reapresentação logo após a rotação (resposta perdida na rede): emite um novo par na mesma família em vez de derrubá-la.
+  // Fora dessa janela, ou para tokens revogados por logout/reset, o reuso continua derrubando a família inteira.
+  if (t.revogado && t.recemRotacionado && !t.expirado && t.ativo) {
+    return emitirSessao(db, config, { id: t.usuario_id, email: t.email }, origem, t.familia);
+  }
   if (t.revogado) {
     await db.query("UPDATE refresh_tokens SET revogado_em = now() WHERE familia = $1 AND revogado_em IS NULL", [t.familia]);
     throw unauthorized();
@@ -83,7 +94,7 @@ export async function renovarSessao(db: Db, config: Config, refreshToken: string
 
   return db.tx(async (q) => {
     const consumido = await q.query(
-      "UPDATE refresh_tokens SET revogado_em = now() WHERE id = $1 AND revogado_em IS NULL",
+      "UPDATE refresh_tokens SET revogado_em = now(), rotacionado_em = now() WHERE id = $1 AND revogado_em IS NULL",
       [t.id],
     );
     if (consumido.rowCount === 0) throw unauthorized(); // corrida: outra requisição já usou este token

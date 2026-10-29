@@ -11,8 +11,10 @@ import { authRoutes, authProtegidas } from "./routes/auth.js";
 import { auditoriaRoutes } from "./routes/auditoria.js";
 import { checkinsRoutes } from "./routes/checkins.js";
 import { conviteRoutesProtegidas, conviteRoutesPublicas } from "./routes/convites.js";
+import { avisarMutacoes, eventosRoutes } from "./routes/eventos.js";
 import { giroRoutes } from "./routes/giro.js";
 import { hospitalRoutes } from "./routes/hospital.js";
+import { observabilidadeRoutes } from "./routes/observabilidade.js";
 import { masterRoutes } from "./routes/master.js";
 import { segurancaRoutes } from "./routes/seguranca.js";
 import { sessaoRoutes } from "./routes/sessao.js";
@@ -46,6 +48,11 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     maxAge: 600,
   });
 
+  // Respostas da API têm dados pessoais e tokens: nada de cache em navegador, proxy ou CDN.
+  app.addHook("onSend", async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+  });
+
   app.setErrorHandler((err: FastifyError | Error, req, reply) => {
     if (err instanceof HttpError) {
       return reply.code(err.status).send({ message: err.message, ...err.extra });
@@ -57,15 +64,37 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     if ((err as { code?: string }).code === "23505") {
       return reply.code(409).send({ message: "Já existe um registro com estes dados." });
     }
+    // Chave estrangeira inexistente (ex.: id de hospital que não existe): erro do cliente, não 500.
+    if ((err as { code?: string }).code === "23503") {
+      return reply.code(422).send({ message: "Registro relacionado não encontrado." });
+    }
     const status = (err as FastifyError).statusCode;
     if (status && status >= 400 && status < 500) {
       const msg =
         status === 413 ? "Requisição grande demais." : status === 429 ? "Muitas requisições. Aguarde um instante." : "Requisição inválida.";
       return reply.code(status).send({ message: msg });
     }
-    req.log.error({ err }, "erro não tratado");
-    return reply.code(500).send({ message: MSG_GENERICA });
+    // O detalhe técnico fica só no log; o cliente recebe uma mensagem genérica e o id da requisição para o suporte correlacionar.
+    req.log.error({ err, requestId: req.id }, "erro não tratado");
+    return reply.code(500).send({ message: MSG_GENERICA, requestId: req.id });
   });
+
+  // Métricas da aba de observabilidade: volume, erros e latência por rota (sem dados do usuário).
+  app.addHook("onClose", async () => {
+    await deps.eventos.encerrar();
+  });
+
+  if (deps.metricas) {
+    const metricas = deps.metricas;
+    app.addHook("onResponse", async (req, reply) => {
+      const rota = req.routeOptions?.url;
+      if (!rota || rota === "/health") return;
+      metricas.registrar(req.method, rota, reply.statusCode, reply.elapsedTime);
+    });
+    app.addHook("onClose", async () => {
+      await metricas.parar();
+    });
+  }
 
   app.setNotFoundHandler((_req, reply) => reply.code(404).send({ message: "Rota não encontrada." }));
 
@@ -97,6 +126,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       }
     });
 
+    avisarMutacoes(protegido, deps);
+
     await protegido.register(authProtegidas(deps));
     await protegido.register(sessaoRoutes(deps));
     await protegido.register(masterRoutes(deps));
@@ -106,6 +137,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     await protegido.register(hospitalRoutes(deps));
     await protegido.register(checkinsRoutes(deps));
     await protegido.register(giroRoutes(deps));
+    await protegido.register(observabilidadeRoutes(deps));
+    await protegido.register(eventosRoutes(deps));
   });
 
   return app;

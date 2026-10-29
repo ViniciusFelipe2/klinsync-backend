@@ -7,7 +7,10 @@ import { buildApp } from "../src/app.js";
 import { loadConfig, type Config } from "../src/config.js";
 import type { Db, Queryable, Row } from "../src/db/index.js";
 import { hashSenha } from "../src/lib/crypto.js";
+import { BarramentoEventos } from "../src/lib/eventos.js";
+import { ColetorMetricas } from "../src/lib/metricas-api.js";
 import type { Externos } from "../src/services/externos.js";
+import { criarMonitorDemo, type Monitor } from "../src/services/monitor.js";
 import type { PhotoStorage } from "../src/services/storage.js";
 
 const aqui = dirname(fileURLToPath(import.meta.url));
@@ -35,6 +38,7 @@ export async function criarBancoDeTeste(): Promise<Db> {
   return {
     ...wrap(pg as never),
     tx: (fn) => pg.transaction((t) => fn(wrap(t as never))),
+    escutar: async (canal, aoReceber) => pg.listen(canal, aoReceber),
     close: () => pg.close(),
   };
 }
@@ -95,27 +99,33 @@ export type Ambiente = {
   db: Db;
   config: Config;
   storage: ReturnType<typeof storageEmMemoria>;
+  metricas: ColetorMetricas;
   fechar: () => Promise<void>;
 };
 
-export async function criarAmbiente(over: { externos?: Partial<Externos>; config?: Record<string, string> } = {}): Promise<Ambiente> {
+export async function criarAmbiente(over: { externos?: Partial<Externos>; config?: Record<string, string>; monitor?: Monitor } = {}): Promise<Ambiente> {
   return montarAmbiente(await criarBancoDeTeste(), over);
 }
 
 /** Monta a aplicação sobre um banco já existente (ex.: um banco recém-importado). */
 export async function montarAmbiente(
   db: Db,
-  over: { externos?: Partial<Externos>; config?: Record<string, string> } = {},
+  over: { externos?: Partial<Externos>; config?: Record<string, string>; monitor?: Monitor } = {},
 ): Promise<Ambiente> {
   const config = configDeTeste(over.config);
   const storage = storageEmMemoria();
-  const app = await buildApp({ config, db, externos: externosDeTeste(over.externos), storage });
+  const eventos = new BarramentoEventos(db);
+  await eventos.iniciar();
+  const metricas = new ColetorMetricas(db);
+  const monitor = over.monitor ?? criarMonitorDemo();
+  const app = await buildApp({ config, db, externos: externosDeTeste(over.externos), storage, monitor, metricas, eventos });
   await app.ready();
   return {
     app,
     db,
     config,
     storage,
+    metricas,
     fechar: async () => {
       await app.close();
       await db.close();

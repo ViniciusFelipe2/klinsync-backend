@@ -91,6 +91,17 @@ describe("hospitais, módulos e dashboard (master)", () => {
     expect(aud.body.eventos.every((e: { hospital: string | null }) => e.hospital === "Hospital A")).toBe(true);
     expect((await chamar(amb.app, "POST", "/auditoria", { token: opA, body: {} })).status).toBe(403);
   });
+
+  it("hospitais com o mesmo nome não compartilham a auditoria (escopo pelo id)", async () => {
+    const homonimo = await criarHospital(amb.db, "Hospital A");
+    await criarUsuarioDireto(amb.db, { email: "adm-homonimo@t.com", role: "hospital_admin", tenantId: homonimo });
+    await tokenDe(amb.app, "adm-homonimo@t.com"); // gera um acesso registrado no outro hospital
+
+    const aud = await chamar(amb.app, "POST", "/auditoria", { token: admA, body: {} });
+    expect(aud.status).toBe(200);
+    expect(JSON.stringify(aud.body.eventos)).not.toContain("adm-homonimo@t.com");
+    expect(aud.body.eventos.some((e: { tenantId?: string }) => "tenantId" in e)).toBe(false);
+  });
 });
 
 describe("salas e limite contratado", () => {

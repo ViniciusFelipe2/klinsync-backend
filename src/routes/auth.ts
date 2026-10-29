@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { Deps } from "../deps.js";
 import { HttpError, locked, unauthorized } from "../errors.js";
-import { chaveMfa, cifrar, decifrar, ehHashLegado, hashSenha, hashSenhaFalso, verificarSenha } from "../lib/crypto.js";
+import { chaveMfa, cifrar, decifrar, hashPrecisaAtualizar, hashSenha, hashSenhaFalso, verificarSenha } from "../lib/crypto.js";
 import { limitarTentativas, verificarBloqueioLogin } from "../lib/limites.js";
 import { exigirPerfilAtivo, perfilDe } from "../lib/perfil.js";
 import { AVISO_CAPTCHA } from "../lib/senha.js";
@@ -76,8 +76,8 @@ export const authRoutes =
         throw unauthorized("E-mail ou senha inválidos.");
       }
       await registrarAcesso({ usuarioId: u.id, email: body.email, tenantId: u.tenant_id, ip, sucesso: true });
-      // Usuários migrados do Supabase (bcrypt): troca para scrypt agora que a senha em texto está disponível.
-      if (ehHashLegado(u.senha_hash)) {
+      // bcrypt (migrado do Supabase) ou scrypt com parâmetros antigos: regrava com os atuais agora que a senha em texto está disponível.
+      if (hashPrecisaAtualizar(u.senha_hash)) {
         await db.query("UPDATE usuarios SET senha_hash = $1 WHERE id = $2", [await hashSenha(body.senha), u.id]);
       }
 
@@ -149,6 +149,31 @@ export const authRoutes =
 export const authProtegidas =
   ({ config, db }: Deps): FastifyPluginAsync =>
   async (app) => {
+    /**
+     * Reautenticação (step-up) para mexer no MFA: exige um código TOTP atual de um fator já verificado.
+     * Sem isso, um access token roubado bastaria para remover o segundo fator. Devolve se o usuário tem MFA ativo.
+     */
+    const exigirCodigoMfaAtual = async (usuarioId: string, codigo: string | undefined): Promise<boolean> => {
+      const fatores = (
+        await db.query<{ id: string; segredo_cifrado: string; ultimo_passo: number }>(
+          "SELECT id, segredo_cifrado, ultimo_passo FROM mfa_fatores WHERE usuario_id = $1 AND status = 'verified'",
+          [usuarioId],
+        )
+      ).rows;
+      if (fatores.length === 0) return false;
+
+      await limitarTentativas(db, `mfa-user:${usuarioId}`, 10, 5 * 60_000, "Muitas tentativas seguidas. Aguarde alguns minutos.");
+      const invalido = () => new HttpError(401, "Informe o código atual do aplicativo autenticador.");
+      const limpo = (codigo ?? "").replace(/\D/g, "");
+      for (const f of fatores) {
+        const v = validarCodigo(decifrar(f.segredo_cifrado, chaveMfa(config)), limpo, Number(f.ultimo_passo));
+        if (!v.ok) continue;
+        const consumido = await db.query("UPDATE mfa_fatores SET ultimo_passo = $1 WHERE id = $2 AND ultimo_passo < $1", [v.passo, f.id]);
+        if (consumido.rowCount > 0) return true;
+      }
+      throw invalido();
+    };
+
     app.get("/auth/me", async (req) => {
       await exigirPerfilAtivo(db, req.auth.userId);
       return { id: req.auth.userId, email: req.auth.email };
@@ -163,8 +188,11 @@ export const authProtegidas =
     });
 
     app.post("/auth/mfa/enroll", async (req) => {
-      const body = z.object({ friendlyName: z.string().trim().max(80).optional() }).parse(req.body ?? {});
+      const body = z
+        .object({ friendlyName: z.string().trim().max(80).optional(), code: z.string().max(12).optional() })
+        .parse(req.body ?? {});
       await exigirPerfilAtivo(db, req.auth.userId);
+      await exigirCodigoMfaAtual(req.auth.userId, body.code); // já tem MFA: cadastrar outro exige o código atual
       const segredo = novoSegredoBase32();
       const id = await db.tx(async (q) => {
         // Cadastros abandonados (não confirmados) são descartados.
@@ -195,9 +223,18 @@ export const authProtegidas =
       return { ok: true as const };
     });
 
-    app.delete<{ Params: { id: string } }>("/auth/mfa/factors/:id", async (req) => {
-      const id = z.string().uuid().parse(req.params.id);
-      await db.query("DELETE FROM mfa_fatores WHERE id = $1 AND usuario_id = $2", [id, req.auth.userId]);
+    /** Remove um fator. Fator ainda não confirmado sai direto; um fator ativo exige o código TOTP atual. */
+    app.post("/auth/mfa/factors/remover", async (req) => {
+      const body = z.object({ factorId: z.string().uuid(), code: z.string().max(12).optional() }).parse(req.body);
+      const fator = (
+        await db.query<{ status: string }>("SELECT status FROM mfa_fatores WHERE id = $1 AND usuario_id = $2", [
+          body.factorId,
+          req.auth.userId,
+        ])
+      ).rows[0];
+      if (!fator) return { ok: true as const };
+      if (fator.status === "verified") await exigirCodigoMfaAtual(req.auth.userId, body.code);
+      await db.query("DELETE FROM mfa_fatores WHERE id = $1 AND usuario_id = $2", [body.factorId, req.auth.userId]);
       return { ok: true as const };
     });
   };

@@ -33,7 +33,7 @@ async function main() {
   }
 
   const config = loadConfig();
-  const db = createPgDb({ connectionString: config.DATABASE_URL, max: 2 });
+  const db = createPgDb({ connectionString: config.DATABASE_URL, max: 2, ssl: { modo: config.DB_SSL, ca: config.DB_SSL_CA } });
   try {
     const gerada = !process.env["MASTER_PASSWORD"];
     const senha = process.env["MASTER_PASSWORD"] ?? senhaAleatoria();

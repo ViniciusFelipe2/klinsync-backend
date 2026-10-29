@@ -13,9 +13,15 @@ let master: string;
 let opId: string;
 
 const sala = async (id: string) => (await amb.db.query("SELECT status_atual, cirurgia_atual FROM salas WHERE id = $1", [id])).rows[0]!;
-const iniciar = (token: string, salaId: string, tipo: string) => chamar(amb.app, "POST", "/giro/etapas/iniciar", { token, body: { salaId, tipo } });
+const TABLET = "tablet-op";
+const iniciar = (token: string, salaId: string, tipo: string, deviceId: string | null = TABLET) =>
+  chamar(amb.app, "POST", "/giro/etapas/iniciar", { token, body: { salaId, tipo, deviceId: deviceId ?? undefined } });
+const vincular = async (salaIds: string[], deviceId = TABLET) => {
+  await amb.db.query("DELETE FROM sala_dispositivos");
+  for (const id of salaIds) await amb.db.query("INSERT INTO sala_dispositivos (sala_id, device_id) VALUES ($1, $2)", [id, deviceId]);
+};
 const finalizar = (token: string, eventoId: string, cirurgiaProxima?: string) =>
-  chamar(amb.app, "POST", "/giro/etapas/finalizar", { token, body: { eventoId, ...(cirurgiaProxima ? { cirurgiaProxima } : {}) } });
+  chamar(amb.app, "POST", "/giro/etapas/finalizar", { token, body: { eventoId, deviceId: TABLET, ...(cirurgiaProxima ? { cirurgiaProxima } : {}) } });
 const abertos = async (token: string) => (await chamar(amb.app, "GET", "/giro/eventos?abertos=true", { token })).body as { id: string; sala_id: string; tipo_evento: string }[];
 
 beforeAll(async () => {
@@ -62,6 +68,11 @@ describe("leitura e isolamento por hospital", () => {
 });
 
 describe("ciclo de giro (enfermagem + limpeza)", () => {
+  beforeAll(async () => {
+    const inativa = (await amb.db.query<{ id: string }>("SELECT id FROM salas WHERE ativa = false")).rows[0]!.id;
+    await vincular([salaA1, salaA2, inativa]);
+  });
+
   it("segue as regras da tela operacional e atualiza o status da sala", async () => {
     // inativa não inicia; limpeza não começa antes da enfermagem
     expect((await iniciar(op, salaA1, "limpeza")).status).toBe(422);
@@ -112,20 +123,29 @@ describe("ciclo de giro (enfermagem + limpeza)", () => {
     expect((await iniciar(op, inativa, "desmontagem")).status).toBe(422);
   });
 
-  it("não é possível iniciar enfermagem com a sala em processo", async () => {
+  it("não existe etapa de remontagem: a montagem da próxima cirurgia acontece dentro da enfermagem", async () => {
     expect((await iniciar(op, salaA1, "remontagem")).status).toBe(422);
+    expect((await iniciar(op, salaA2, "remontagem")).status).toBe(422); // nem com a sala livre
+    expect((await abertos(op)).filter((e) => e.tipo_evento === "remontagem")).toHaveLength(0);
+  });
+
+  it("não é possível iniciar enfermagem com a sala em processo", async () => {
+    await amb.db.query("UPDATE salas SET status_atual = 'limpeza' WHERE id = $1", [salaA2]);
+    expect((await iniciar(op, salaA2, "desmontagem")).status).toBe(422);
+    await amb.db.query("UPDATE salas SET status_atual = 'livre' WHERE id = $1", [salaA2]);
   });
 });
 
 describe("sala parada", () => {
+  beforeAll(() => vincular([salaA1, salaA2]));
   it("inicia, impede duplicidade e finaliza com duração", async () => {
-    expect((await chamar(amb.app, "POST", "/giro/paradas/iniciar", { token: op, body: { salaId: salaA2 } })).status).toBe(200);
-    expect((await chamar(amb.app, "POST", "/giro/paradas/iniciar", { token: op, body: { salaId: salaA2 } })).status).toBe(409);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/iniciar", { token: op, body: { salaId: salaA2, deviceId: TABLET } })).status).toBe(200);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/iniciar", { token: op, body: { salaId: salaA2, deviceId: TABLET } })).status).toBe(409);
     const aberta = (await chamar(amb.app, "GET", "/giro/paradas?abertas=true", { token: op })).body as { id: string; sala_id: string }[];
     expect(aberta).toHaveLength(1);
-    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: opB, body: { paradaId: aberta[0]!.id } })).status).toBe(404);
-    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: aberta[0]!.id } })).status).toBe(200);
-    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: aberta[0]!.id } })).status).toBe(409);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: opB, body: { paradaId: aberta[0]!.id, deviceId: TABLET } })).status).toBe(404);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: aberta[0]!.id, deviceId: TABLET } })).status).toBe(200);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: aberta[0]!.id, deviceId: TABLET } })).status).toBe(409);
     expect((await amb.db.query("SELECT duracao_segundos FROM eventos_sala_parada WHERE id = $1", [aberta[0]!.id])).rows[0]!["duracao_segundos"]).toBeGreaterThanOrEqual(0);
     expect((await chamar(amb.app, "GET", "/giro/paradas?abertas=true", { token: op })).body).toHaveLength(0);
   });
@@ -147,6 +167,7 @@ describe("histórico", () => {
 
 describe("vínculo sala <-> tablet", () => {
   it("reserva permanente: só o mesmo tablet mantém; admin pode liberar", async () => {
+    await amb.db.query("DELETE FROM sala_dispositivos");
     const reservar = (token: string, salaId: string, deviceId: string) =>
       chamar(amb.app, "POST", "/giro/reservas/reservar", { token, body: { salaId, deviceId } });
 
@@ -174,6 +195,63 @@ describe("vínculo sala <-> tablet", () => {
     await chamar(amb.app, "POST", "/giro/reservas/liberar", { token: op, body: { salaId: salaA2, deviceId: "tablet-1" } });
     expect((await chamar(amb.app, "GET", "/giro/reservas", { token: op })).body).toHaveLength(0);
     expect(salaB1).toBeTruthy();
+  });
+});
+
+describe("operações exigem o tablet vinculado à sala", () => {
+  let salaT: string;
+  beforeAll(async () => {
+    // sala própria: não interfere nas estatísticas dos demais testes
+    salaT = (await amb.db.query<{ id: string }>("INSERT INTO salas (tenant_id, nome) VALUES ($1, 'Sala Tablet') RETURNING id", [tenantA])).rows[0]!.id;
+    await vincular([salaT]);
+  });
+  afterAll(async () => {
+    await amb.db.query("DELETE FROM salas WHERE id = $1", [salaT]); // apaga eventos junto (cascade)
+  });
+
+  it("operador sem vínculo, com outro tablet ou sem deviceId é recusado (403); o tablet certo passa", async () => {
+    expect((await iniciar(op, salaA2, "desmontagem")).status).toBe(403); // sala sem vínculo
+    expect((await iniciar(op, salaT, "desmontagem", "tablet-intruso")).status).toBe(403); // sala de outro tablet
+    expect((await iniciar(op, salaT, "desmontagem", null)).status).toBe(403); // sem deviceId
+    const parada = (b: object) => chamar(amb.app, "POST", "/giro/paradas/iniciar", { token: op, body: { salaId: salaT, ...b } });
+    expect((await parada({})).status).toBe(403);
+    expect((await parada({ deviceId: "tablet-intruso" })).status).toBe(403);
+    expect((await parada({ deviceId: TABLET })).status).toBe(200);
+    const p = (await chamar(amb.app, "GET", "/giro/paradas?abertas=true", { token: op })).body[0] as { id: string };
+    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: p.id, deviceId: "tablet-intruso" } })).status).toBe(403);
+    expect((await chamar(amb.app, "POST", "/giro/paradas/finalizar", { token: op, body: { paradaId: p.id, deviceId: TABLET } })).status).toBe(200);
+
+    expect((await iniciar(op, salaT, "desmontagem")).status).toBe(200);
+    const ev = (await abertos(op)).find((e) => e.sala_id === salaT)!;
+    expect((await chamar(amb.app, "POST", "/giro/etapas/finalizar", { token: op, body: { eventoId: ev.id, deviceId: "tablet-intruso", cirurgiaProxima: "X" } })).status).toBe(403);
+  });
+
+  it("administrador do hospital opera sem tablet", async () => {
+    const r = await iniciar(adm, salaT, "limpeza", null);
+    expect(r.status).toBe(200);
+  });
+});
+
+describe("módulo liberado no servidor", () => {
+  it("hospital inativo, feature desligada e login de outra feature são recusados em giro e check-in", async () => {
+    const t = await criarHospital(amb.db, "Hospital C");
+    const fg = await habilitarFeature(amb.db, t, "giro_de_sala");
+    const fc = (await amb.db.query<{ id: string }>("SELECT id FROM features WHERE chave = 'checkin_cirurgioes'")).rows[0]!.id;
+    await criarUsuarioDireto(amb.db, { email: "op-c@t.com", role: "operador", tenantId: t, featureId: fg });
+    await criarUsuarioDireto(amb.db, { email: "op-c2@t.com", role: "operador", tenantId: t, featureId: fc });
+    const tc = await tokenDe(amb.app, "op-c@t.com");
+    const tc2 = await tokenDe(amb.app, "op-c2@t.com");
+
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(200);
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc2 })).status).toBe(403); // vinculado a outra feature
+    expect((await chamar(amb.app, "POST", "/checkins/listar", { token: tc, body: {} })).status).toBe(403); // check-in não contratado
+
+    await amb.db.query("UPDATE tenants SET status = 'inadimplente' WHERE id = $1", [t]);
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(403);
+    await amb.db.query("UPDATE tenants SET status = 'ativo' WHERE id = $1", [t]);
+    await amb.db.query("UPDATE tenant_features SET habilitada = false WHERE tenant_id = $1", [t]);
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(403);
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: master })).status).toBe(200); // suporte master
   });
 });
 

@@ -9,6 +9,9 @@
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { criarExternos } from "../src/services/externos.js";
+import { BarramentoEventos } from "../src/lib/eventos.js";
+import { ColetorMetricas } from "../src/lib/metricas-api.js";
+import { criarMonitorAws, criarMonitorDemo } from "../src/services/monitor.js";
 import { criarStorageS3 } from "../src/services/storage.js";
 import { abrirBancoLocal, RAIZ } from "./pglite-local.js";
 import { criarStorageLocal } from "./storage-local.js";
@@ -29,6 +32,8 @@ const config = loadConfig({
   TRUST_PROXY: "false",
   GEOIP_ENABLED: "false",
   HIBP_ENABLED: "false",
+  MONITOR_MODO: process.env["MONITOR_MODO"] ?? "aws",
+  ORCAMENTO_MENSAL_USD: process.env["ORCAMENTO_MENSAL_USD"] ?? "",
   LOG_LEVEL: process.env["LOG_LEVEL"] ?? "info",
 });
 
@@ -36,7 +41,12 @@ const banco = await abrirBancoLocal();
 // Fotos: S3 real se CHECKIN_PHOTOS_BUCKET estiver definido; senão, em disco (.local-db/fotos), servidas por esta API.
 const local = criarStorageLocal(join(RAIZ, ".local-db", "fotos"), `http://${config.HOST}:${config.PORT}`);
 const storage = config.CHECKIN_PHOTOS_BUCKET ? criarStorageS3(config) : local.storage;
-const app = await buildApp({ config, db: banco.db, externos: criarExternos(config), storage });
+const eventos = new BarramentoEventos(banco.db);
+await eventos.iniciar();
+const metricas = new ColetorMetricas(banco.db);
+metricas.iniciar(5_000);
+const monitor = config.MONITOR_MODO === "demo" ? criarMonitorDemo() : criarMonitorAws(config);
+const app = await buildApp({ config, db: banco.db, externos: criarExternos(config), storage, monitor, metricas, eventos });
 if (!config.CHECKIN_PHOTOS_BUCKET) local.registrarRota(app);
 
 const encerrar = async () => {

@@ -41,12 +41,12 @@ export const masterRoutes =
       const d = z
         .object({
           id: uuid.nullish(),
-          nome: z.string().trim().min(2),
-          cnpj: z.string().nullish(),
-          endereco: z.string().nullish(),
-          contato_nome: z.string().nullish(),
-          contato_email: z.string().nullish(),
-          contato_telefone: z.string().nullish(),
+          nome: z.string().trim().min(2).max(160),
+          cnpj: z.string().max(32).nullish(),
+          endereco: z.string().max(300).nullish(),
+          contato_nome: z.string().max(120).nullish(),
+          contato_email: z.string().max(255).nullish(),
+          contato_telefone: z.string().max(40).nullish(),
           status: z.enum(["ativo", "inativo", "inadimplente"]),
           limite_salas: z.number().int().min(1).max(500).nullish(),
         })
@@ -165,9 +165,9 @@ export const masterRoutes =
     app.post("/master/usuarios/criar", async (req) => {
       const d = z
         .object({
-          email: z.string().email(),
+          email: z.string().email().max(255),
           senha: senhaForte,
-          nome: z.string().min(2),
+          nome: z.string().trim().min(2).max(120),
           role: z.enum(["master_admin", "hospital_admin", "operador"]),
           tenantId: uuid.nullish(),
           featureId: uuid.nullish(),

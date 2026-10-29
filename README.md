@@ -94,6 +94,10 @@ Sessões (refresh tokens) não migram: todos entram de novo uma vez.
 
 ### Passo a passo
 
+   > **Atenção (privilégios mínimos):** a importação faz `TRUNCATE` no destino, e a role da API (`klinsync_app`) não tem esse privilégio
+   > (ver `klinsync-db`). Para o destino já endurecido, prefira gerar o dump (`npm run local:dump`) e carregá-lo como dono
+   > (`psql ... -c "SET ROLE klinsync_owner" -f -`), ou rode o `import-supabase` com uma conexão de dono do banco.
+
 1. **Pré-requisitos:** schema aplicado no destino (`sudo klinsync-db-deploy`), backend com `DATABASE_URL`, `JWT_*`, `MFA_ENCRYPTION_KEY` e
    (para fotos) `CHECKIN_PHOTOS_BUCKET` configurados em `/etc/klinsync/backend.env`.
 2. **String de conexão do Supabase** (Dashboard → Settings → Database → Connection string). Use a **conexão direta** ou o **Session pooler** (porta 5432);
@@ -134,6 +138,7 @@ Ver [.env.example](.env.example). Em produção vêm de `/etc/klinsync/backend.e
 | Variável | Descrição |
 | --- | --- |
 | `DATABASE_URL`, `DB_POOL_MAX` | Postgres e tamanho do pool **por instância** (o `klinsync-tune` calcula `DB_POOL_MAX` conforme a EC2) |
+| `DB_SSL`, `DB_SSL_CA` | TLS com o Postgres: `disable` (padrão), `require` (cifra) ou `verify` (cifra e valida o certificado; `DB_SSL_CA` com a CA). Em produção use `require` ou `verify`. |
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | Segredos (≥ 32 caracteres) |
 | `MFA_ENCRYPTION_KEY` | Cifra os segredos TOTP; se vazio deriva de `JWT_REFRESH_SECRET` |
 | `CORS_ORIGIN` | Origens permitidas (vírgula). Ex.: `https://app.seudominio.com.br` |

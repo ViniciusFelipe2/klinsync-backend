@@ -30,6 +30,7 @@ APP_ENTRY="${APP_ENTRY:-dist/server.js}"      # arquivo de entrada dentro da rel
 PM2_APP_NAME="${PM2_APP_NAME:-klinsync-backend}"
 HEALTH_PATH="${HEALTH_PATH:-/health}"
 DATABASE_URL="${DATABASE_URL:-}"              # postgresql://klinsync_app:SENHA@IP_PRIVADO_DB:5432/klinsync
+DB_SSL="${DB_SSL:-require}"                   # TLS com o Postgres (o servidor de DB aceita só hostssl em instalações novas)
 DB_MAX_CONNECTIONS="${DB_MAX_CONNECTIONS:-100}"  # max_connections do Postgres (a EC2 de DB informa o valor)
 PM2_INSTANCES_OVERRIDE="${PM2_INSTANCES_OVERRIDE:-}"  # força o nº de instâncias PM2 (vazio = automático)
 # -----------------------------------------------------------------------------
@@ -103,6 +104,7 @@ HOST=127.0.0.1
 PORT=$APP_PORT
 CORS_ORIGIN=$CORS_ORIGIN
 DATABASE_URL=${DATABASE_URL:-COLE_AQUI_A_URL_DO_POSTGRES}
+DB_SSL=$DB_SSL
 JWT_ACCESS_SECRET=$(openssl rand -hex 32)
 JWT_REFRESH_SECRET=$(openssl rand -hex 32)
 MFA_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -157,6 +159,16 @@ server {
         limit_req zone=klinsync_auth burst=10 nodelay;
         proxy_pass http://klinsync_app;
         include /etc/nginx/klinsync-proxy.conf;
+    }
+
+    # Tempo real (SSE): conexão longa, sem buffer. Os painéis e tablets recebem avisos na hora.
+    location = /eventos/stream {
+        proxy_pass http://klinsync_app;
+        include /etc/nginx/klinsync-proxy.conf;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
     }
 
     location / {

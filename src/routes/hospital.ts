@@ -9,8 +9,8 @@ import { Where, dataLocal, dataValida, ehUuid, escaparLike, limitesDoPeriodo } f
 const paginacao = {
   pagina: z.number().int().min(1).default(1),
   porPagina: z.number().int().min(5).max(200).default(20),
-  de: z.string().optional(),
-  ate: z.string().optional(),
+  de: z.string().max(10).optional(),
+  ate: z.string().max(10).optional(),
 };
 
 type EventoGiro = {
@@ -125,7 +125,7 @@ export const hospitalRoutes =
 
     /** Check-ins do hospital com filtro por nome/período e paginação. */
     app.post("/hospital/checkins", async (req) => {
-      const d = z.object({ busca: z.string().optional(), ...paginacao }).parse(req.body ?? {});
+      const d = z.object({ busca: z.string().max(120).optional(), ...paginacao }).parse(req.body ?? {});
       const perfil = await exigirHospitalAdmin(db, req.auth.userId);
       const w = new Where().add("tenant_id = ?", perfil.tenant_id);
       if (d.busca) w.add("doctor_name ILIKE ?", `%${escaparLike(d.busca)}%`);
@@ -146,8 +146,8 @@ export const hospitalRoutes =
     app.post("/hospital/giro", async (req) => {
       const d = z
         .object({
-          salaId: z.string().optional(),
-          etapa: z.enum(["todas", "desmontagem", "limpeza", "remontagem"]).default("todas"),
+          salaId: z.string().max(40).optional(),
+          etapa: z.enum(["todas", "desmontagem", "limpeza"]).default("todas"),
           ...paginacao,
         })
         .parse(req.body ?? {});
@@ -254,7 +254,7 @@ export const hospitalRoutes =
 
     /** Registro de acessos do próprio hospital, com paginação. */
     app.post("/hospital/acessos", async (req) => {
-      const d = z.object({ busca: z.string().optional(), ...paginacao }).parse(req.body ?? {});
+      const d = z.object({ busca: z.string().max(120).optional(), ...paginacao }).parse(req.body ?? {});
       const perfil = await exigirHospitalAdmin(db, req.auth.userId);
       const w = new Where().add("tenant_id = ?", perfil.tenant_id);
       await filtroPeriodo(w, "created_at", d.de, d.ate);
@@ -276,7 +276,7 @@ export const hospitalRoutes =
      * estava rodando), tempo da limpeza e ciclo geral (enfermagem + limpeza).
      */
     app.post("/hospital/giro/estatisticas", async (req) => {
-      const d = z.object({ de: z.string().optional(), ate: z.string().optional() }).parse(req.body ?? {});
+      const d = z.object({ de: z.string().max(10).optional(), ate: z.string().max(10).optional() }).parse(req.body ?? {});
       const perfil = await exigirHospitalAdmin(db, req.auth.userId);
       const { de, ate } = await limitesDoPeriodo(db, tz, dataValida(d.de), dataValida(d.ate), { dias: 30 });
 
@@ -371,7 +371,7 @@ export const hospitalRoutes =
 
     /** Paradas de sala: lista detalhada com filtro por dia/sala e paginação. */
     app.post("/hospital/paradas", async (req) => {
-      const d = z.object({ salaId: z.string().optional(), ...paginacao }).parse(req.body ?? {});
+      const d = z.object({ salaId: z.string().max(40).optional(), ...paginacao }).parse(req.body ?? {});
       const perfil = await exigirHospitalAdmin(db, req.auth.userId);
 
       const w = new Where().add("s.tenant_id = ?", perfil.tenant_id);
@@ -405,7 +405,7 @@ export const hospitalRoutes =
     /** Tempo de sala parada por sala: total no período e médias nas janelas de 7/15/30/45 dias. */
     app.post("/hospital/paradas/estatisticas", async (req) => {
       const d = z
-        .object({ salaId: z.string().optional(), de: z.string().optional(), ate: z.string().optional() })
+        .object({ salaId: z.string().max(40).optional(), de: z.string().max(10).optional(), ate: z.string().max(10).optional() })
         .parse(req.body ?? {});
       const perfil = await exigirHospitalAdmin(db, req.auth.userId);
 

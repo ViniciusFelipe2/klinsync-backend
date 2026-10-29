@@ -37,8 +37,8 @@ export const conviteRoutesProtegidas =
     app.post("/convites/criar", async (req) => {
       const d = z
         .object({
-          nome: z.string().min(2),
-          email: z.string().email(),
+          nome: z.string().trim().min(2).max(120),
+          email: z.string().email().max(255),
           role: z.enum(["master_admin", "hospital_admin", "operador"]),
           tenantId: uuid.nullish(),
           featureId: uuid.nullish(),

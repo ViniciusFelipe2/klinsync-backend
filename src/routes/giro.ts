@@ -1,16 +1,19 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { Deps } from "../deps.js";
-import { conflict, notFound, unprocessable } from "../errors.js";
-import { escopoTenant } from "../lib/perfil.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { exigirModulo } from "../lib/modulo.js";
+import type { Perfil } from "../lib/perfil.js";
 import type { Queryable } from "../db/index.js";
 
 const uuid = z.string().uuid();
+const deviceIdSchema = z.string().trim().min(1).max(200);
 
 type SalaLinha = { id: string; tenant_id: string; nome: string; ativa: boolean; status_atual: string; cirurgia_atual: string | null };
 type EventoLinha = {
   id: string;
   sala_id: string;
+  /** "remontagem" só existe em registros antigos: a montagem da próxima cirurgia acontece dentro da enfermagem. */
   tipo_evento: "desmontagem" | "limpeza" | "remontagem";
   inicio: string;
   fim: string | null;
@@ -38,10 +41,22 @@ export const giroRoutes =
       return sala;
     };
 
+    /**
+     * Operações do tablet (iniciar/finalizar etapa e parada) só valem para o tablet vinculado à sala.
+     * Administradores (hospital/master) operam sem tablet.
+     */
+    const exigirTabletDaSala = async (q: Queryable, perfil: Perfil, salaId: string, deviceId: string | undefined) => {
+      if (perfil.role !== "operador") return;
+      const r = deviceId
+        ? await q.query("SELECT 1 FROM sala_dispositivos WHERE sala_id = $1 AND device_id = $2", [salaId, deviceId])
+        : { rowCount: 0 };
+      if (r.rowCount === 0) throw forbidden("Esta sala não está vinculada a este tablet. Selecione a sala novamente.");
+    };
+
     /* ---------------------------------------- Leitura ---------------------------------------- */
 
     app.get("/giro/salas", async (req) => {
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const r = await db.query(
         `SELECT id, nome, ativa, status_atual, updated_at, cirurgia_atual FROM salas
           WHERE ativa AND ($1::uuid IS NULL OR tenant_id = $1) ORDER BY nome`,
@@ -54,7 +69,7 @@ export const giroRoutes =
       const q = z
         .object({ abertos: z.enum(["true", "false"]).optional(), horas: z.coerce.number().int().min(1).max(168).optional() })
         .parse(req.query);
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const aberto = q.abertos === "true";
       const horas = q.horas ?? 48;
       const r = await db.query(
@@ -69,7 +84,7 @@ export const giroRoutes =
 
     app.get("/giro/paradas", async (req) => {
       z.object({ abertas: z.enum(["true", "false"]).optional() }).parse(req.query);
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const r = await db.query(
         `SELECT ${COLUNAS_PARADA} FROM eventos_sala_parada p JOIN salas s ON s.id = p.sala_id
           WHERE ($1::uuid IS NULL OR s.tenant_id = $1) AND p.fim IS NULL ORDER BY p.inicio DESC`,
@@ -83,7 +98,7 @@ export const giroRoutes =
       if (new Date(q.ate).getTime() - new Date(q.de).getTime() > 366 * 86400_000) {
         throw unprocessable("O período máximo é de 366 dias.");
       }
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const [giro, paradas] = await Promise.all([
         db.query(
           `SELECT ${COLUNAS_EVENTO} FROM eventos_giro e JOIN salas s ON s.id = e.sala_id
@@ -104,11 +119,12 @@ export const giroRoutes =
     /* ---------------------------------- Etapas do giro ---------------------------------- */
 
     app.post("/giro/etapas/iniciar", async (req) => {
-      const d = z.object({ salaId: uuid, tipo: z.enum(["desmontagem", "limpeza", "remontagem"]) }).parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const d = z.object({ salaId: uuid, tipo: z.enum(["desmontagem", "limpeza"]), deviceId: deviceIdSchema.optional() }).parse(req.body);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
 
       await db.tx(async (q) => {
         const sala = await salaDoEscopo(q, d.salaId, tenantId);
+        await exigirTabletDaSala(q, perfil, sala.id, d.deviceId);
         if (!sala.ativa) throw unprocessable("Esta sala está inativa.");
 
         const abertos = (
@@ -131,8 +147,6 @@ export const giroRoutes =
             [sala.id, enfermagem.inicio],
           );
           if (feita.rowCount > 0) throw unprocessable("A limpeza deste ciclo já foi finalizada.");
-        } else {
-          if (abertos.length > 0 || sala.status_atual !== "livre") throw unprocessable("A remontagem só pode ser iniciada com a sala livre.");
         }
 
         await q.query(
@@ -146,8 +160,8 @@ export const giroRoutes =
     });
 
     app.post("/giro/etapas/finalizar", async (req) => {
-      const d = z.object({ eventoId: uuid, cirurgiaProxima: z.string().trim().max(200).optional() }).parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const d = z.object({ eventoId: uuid, cirurgiaProxima: z.string().trim().max(200).optional(), deviceId: deviceIdSchema.optional() }).parse(req.body);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
 
       await db.tx(async (q) => {
         const ev = (
@@ -161,6 +175,7 @@ export const giroRoutes =
         if (!ev) throw notFound("Etapa não encontrada.");
         if (ev.fim) throw conflict("Esta etapa já foi finalizada.");
         await salaDoEscopo(q, ev.sala_id, tenantId);
+        await exigirTabletDaSala(q, perfil, ev.sala_id, d.deviceId);
 
         let proxima: string | null = null;
         if (ev.tipo_evento === "desmontagem") {
@@ -197,10 +212,11 @@ export const giroRoutes =
     /* ---------------------------------- Sala parada ---------------------------------- */
 
     app.post("/giro/paradas/iniciar", async (req) => {
-      const { salaId } = z.object({ salaId: uuid }).parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const { salaId, deviceId } = z.object({ salaId: uuid, deviceId: deviceIdSchema.optional() }).parse(req.body);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       await db.tx(async (q) => {
         const sala = await salaDoEscopo(q, salaId, tenantId);
+        await exigirTabletDaSala(q, perfil, sala.id, deviceId);
         const aberta = await q.query("SELECT 1 FROM eventos_sala_parada WHERE sala_id = $1 AND fim IS NULL", [sala.id]);
         if (aberta.rowCount > 0) throw conflict("A sala já está marcada como parada.");
         await q.query("INSERT INTO eventos_sala_parada (sala_id, usuario_inicio_id) VALUES ($1, $2)", [sala.id, perfil.id]);
@@ -209,8 +225,8 @@ export const giroRoutes =
     });
 
     app.post("/giro/paradas/finalizar", async (req) => {
-      const { paradaId } = z.object({ paradaId: uuid }).parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const { paradaId, deviceId } = z.object({ paradaId: uuid, deviceId: deviceIdSchema.optional() }).parse(req.body);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       await db.tx(async (q) => {
         const p = (
           await q.query<{ id: string; sala_id: string; fim: string | null }>(
@@ -221,6 +237,7 @@ export const giroRoutes =
         ).rows[0];
         if (!p) throw notFound("Parada não encontrada.");
         if (p.fim) throw conflict("Esta parada já foi finalizada.");
+        await exigirTabletDaSala(q, perfil, p.sala_id, deviceId);
         await q.query(
           `UPDATE eventos_sala_parada SET fim = now(), duracao_segundos = ${SQL_DURACAO}, usuario_fim_id = $2 WHERE id = $1`,
           [p.id, perfil.id],
@@ -232,7 +249,7 @@ export const giroRoutes =
     /* ------------------------------ Vínculo sala <-> tablet ------------------------------ */
 
     app.get("/giro/reservas", async (req) => {
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const r = await db.query(
         `SELECT d.sala_id, d.device_id, d.ultimo_sinal FROM sala_dispositivos d JOIN salas s ON s.id = d.sala_id
           WHERE ($1::uuid IS NULL OR s.tenant_id = $1)`,
@@ -241,12 +258,12 @@ export const giroRoutes =
       return r.rows;
     });
 
-    const reservaSchema = z.object({ salaId: uuid, deviceId: z.string().trim().min(1).max(200) });
+    const reservaSchema = z.object({ salaId: uuid, deviceId: deviceIdSchema });
 
     /** O vínculo é permanente: só muda quando o próprio tablet o libera (ou um administrador). */
     app.post("/giro/reservas/reservar", async (req) => {
       const d = reservaSchema.parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const reservada = await db.tx(async (q) => {
         await salaDoEscopo(q, d.salaId, tenantId);
         // Um tablet só pode estar vinculado a uma sala por vez.
@@ -265,7 +282,7 @@ export const giroRoutes =
 
     app.post("/giro/reservas/liberar", async (req) => {
       const d = reservaSchema.parse(req.body);
-      const { perfil, tenantId } = await escopoTenant(db, req.auth.userId);
+      const { perfil, tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       const admin = perfil.role !== "operador";
       await db.tx(async (q) => {
         await salaDoEscopo(q, d.salaId, tenantId);
@@ -276,7 +293,7 @@ export const giroRoutes =
 
     app.post("/giro/reservas/heartbeat", async (req) => {
       const d = reservaSchema.parse(req.body);
-      const { tenantId } = await escopoTenant(db, req.auth.userId);
+      const { tenantId } = await exigirModulo(db, req.auth.userId, "giro_de_sala");
       await db.query(
         `UPDATE sala_dispositivos SET ultimo_sinal = now()
           WHERE sala_id = $1 AND device_id = $2

@@ -12,6 +12,8 @@ type EventoAuditoria = {
   detalhe: string;
   autor: string | null;
   hospital: string | null;
+  /** Usado só para o filtro de escopo; não é enviado ao cliente. */
+  tenantId: string | null;
   sucesso: boolean | null;
   ip: string | null;
   regiao: string | null;
@@ -99,6 +101,7 @@ export const auditoriaRoutes =
           detalhe: a.email_tentado ?? nomeDe(a.usuario_id) ?? "desconhecido",
           autor: nomeDe(a.usuario_id) ?? a.email_tentado,
           hospital: tenantDe(a.tenant_id),
+          tenantId: a.tenant_id,
           sucesso: a.sucesso,
           ip: a.ip,
           regiao: a.pais_regiao,
@@ -107,7 +110,7 @@ export const auditoriaRoutes =
 
       for (const a of acoes.rows) {
         const det = a.detalhes ?? {};
-        const tenantId = (det["tenant_id"] as string | undefined) ?? null;
+        const tenantId = (det["tenant_id"] as string | undefined) ?? (det["tenantId"] as string | undefined) ?? null;
         const featureId = (det["feature_id"] as string | undefined) ?? (det["featureId"] as string | undefined) ?? null;
         const partes: string[] = [];
         if (det["email"]) partes.push(String(det["email"]));
@@ -123,7 +126,8 @@ export const auditoriaRoutes =
           titulo: ROTULO_ACAO[a.acao] ?? a.acao,
           detalhe: partes.filter(Boolean).join(" · ") || "—",
           autor: nomeDe(a.usuario_id),
-          hospital: tenantDe(tenantId ?? (det["tenantId"] as string | undefined) ?? null),
+          hospital: tenantDe(tenantId),
+          tenantId,
           sucesso: null,
           ip: null,
           regiao: null,
@@ -139,6 +143,7 @@ export const auditoriaRoutes =
           detalhe: mapaFeature.get(h.feature_id) ?? h.feature_id.slice(0, 8),
           autor: nomeDe(h.alterado_por),
           hospital: tenantDe(h.tenant_id),
+          tenantId: h.tenant_id,
           sucesso: null,
           ip: null,
           regiao: null,
@@ -146,11 +151,12 @@ export const auditoriaRoutes =
       }
 
       const meuHospital = tenantDe(perfil.tenant_id);
-      const visiveis = master ? eventos : eventos.filter((e) => e.hospital && e.hospital === meuHospital);
+      // O escopo do hospital é pelo id (o nome não é único).
+      const visiveis = master ? eventos : eventos.filter((e) => e.tenantId !== null && e.tenantId === perfil.tenant_id);
       visiveis.sort((a, b) => new Date(b.quando).getTime() - new Date(a.quando).getTime());
 
       return {
-        eventos: visiveis.slice(0, 800),
+        eventos: visiveis.slice(0, 800).map(({ tenantId: _tenantId, ...e }) => e),
         hospitais: master ? tenants.rows.map((t) => t.nome) : [meuHospital].filter((x): x is string => !!x),
       };
     });

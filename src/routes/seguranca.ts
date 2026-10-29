@@ -252,8 +252,9 @@ export const segurancaRoutes =
         db.query<{ expira_em: string; aceito_em: string | null; revogado_em: string | null }>(
           "SELECT expira_em, aceito_em, revogado_em FROM convites",
         ),
-        db.query<{ super: boolean; tabelas: number }>(
+        db.query<{ super: boolean; ddl: boolean; tabelas: number }>(
           `SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS super,
+                  has_schema_privilege(current_user, 'public', 'CREATE') AS ddl,
                   (SELECT count(*)::int FROM information_schema.tables
                     WHERE table_schema = 'public' AND table_type = 'BASE TABLE') AS tabelas`,
         ),
@@ -267,6 +268,7 @@ export const segurancaRoutes =
       const semMfa = contas.filter((c) => !c.mfa).length;
       const politicaFrouxa = !cfg || cfg.max_tentativas > 8 || cfg.janela_minutos > 60 || cfg.bloqueio_minutos < 10;
       const superuser = banco.rows[0]?.super === true;
+      const podeDdl = banco.rows[0]?.ddl === true;
       const totalTabelas = banco.rows[0]?.tabelas ?? 0;
 
       const checagens: Checagem[] = [
@@ -286,10 +288,14 @@ export const segurancaRoutes =
         {
           id: "role-banco",
           categoria: "banco",
-          titulo: "Aplicação sem superusuário do banco",
-          descricao: "A API deve se conectar ao Postgres com uma role sem privilégios de superusuário.",
-          status: superuser ? "critico" : "ok",
-          detalhe: superuser ? "A API está conectada como superusuário" : "Role de aplicação restrita",
+          titulo: "Aplicação com privilégios mínimos no banco",
+          descricao: "A API deve usar uma role sem superusuário e sem DDL (só leitura/escrita de dados); o schema pertence a outra role.",
+          status: superuser ? "critico" : podeDdl ? "atencao" : "ok",
+          detalhe: superuser
+            ? "A API está conectada como superusuário"
+            : podeDdl
+              ? "A role da API pode criar objetos no schema (aplique a migration 0006 e separe a role dona)"
+              : "Role de aplicação restrita (só DML)",
           itens: [],
         },
         {
