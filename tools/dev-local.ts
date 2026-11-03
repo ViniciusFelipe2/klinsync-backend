@@ -39,7 +39,8 @@ const config = loadConfig({
 
 const banco = await abrirBancoLocal();
 // Fotos: S3 real se CHECKIN_PHOTOS_BUCKET estiver definido; senão, em disco (.local-db/fotos), servidas por esta API.
-const local = criarStorageLocal(join(RAIZ, ".local-db", "fotos"), `http://${config.HOST}:${config.PORT}`);
+// API_PUBLIC_URL: endereço pelo qual OUTROS aparelhos alcançam esta API (ex.: http://192.168.0.108:3000).
+const local = criarStorageLocal(join(RAIZ, ".local-db", "fotos"), process.env["API_PUBLIC_URL"] ?? `http://${config.HOST}:${config.PORT}`);
 const storage = config.CHECKIN_PHOTOS_BUCKET ? criarStorageS3(config) : local.storage;
 const eventos = new BarramentoEventos(banco.db);
 await eventos.iniciar();

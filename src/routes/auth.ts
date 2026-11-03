@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { Deps } from "../deps.js";
-import { HttpError, locked, unauthorized } from "../errors.js";
+import { HttpError, forbidden, locked, unauthorized } from "../errors.js";
+import { MSG_HOSPITAL_INDISPONIVEL, MSG_LOGIN_NAO_REALIZADO } from "../lib/hospital.js";
 import { chaveMfa, cifrar, decifrar, hashPrecisaAtualizar, hashSenha, hashSenhaFalso, verificarSenha } from "../lib/crypto.js";
 import { limitarTentativas, verificarBloqueioLogin } from "../lib/limites.js";
 import { exigirPerfilAtivo, perfilDe } from "../lib/perfil.js";
@@ -61,9 +62,19 @@ export const authRoutes =
       }
 
       const u = (
-        await db.query<{ id: string; email: string; senha_hash: string; ativo: boolean | null; tenant_id: string | null }>(
-          `SELECT u.id, u.email, u.senha_hash, p.ativo, p.tenant_id
-             FROM usuarios u LEFT JOIN usuarios_perfil p ON p.id = u.id
+        await db.query<{
+          id: string;
+          email: string;
+          senha_hash: string;
+          ativo: boolean | null;
+          tenant_id: string | null;
+          role: string | null;
+          hospital_status: string | null;
+        }>(
+          `SELECT u.id, u.email, u.senha_hash, p.ativo, p.tenant_id, p.role, t.status AS hospital_status
+             FROM usuarios u
+             LEFT JOIN usuarios_perfil p ON p.id = u.id
+             LEFT JOIN tenants t ON t.id = p.tenant_id
             WHERE lower(u.email) = $1`,
           [body.email],
         )
@@ -74,6 +85,11 @@ export const authRoutes =
       if (!u || !senhaOk || !u.ativo) {
         await registrarAcesso({ usuarioId: u?.id ?? null, email: body.email, tenantId: u?.tenant_id ?? null, ip, sucesso: false });
         throw unauthorized("E-mail ou senha inválidos.");
+      }
+      // Só chega aqui quem acertou a senha, então dizer que o hospital está desativado não revela nada a estranhos.
+      if (u.tenant_id && u.hospital_status !== "ativo") {
+        await registrarAcesso({ usuarioId: u.id, email: body.email, tenantId: u.tenant_id, ip, sucesso: false });
+        throw forbidden(u.role === "hospital_admin" ? MSG_HOSPITAL_INDISPONIVEL : MSG_LOGIN_NAO_REALIZADO);
       }
       await registrarAcesso({ usuarioId: u.id, email: body.email, tenantId: u.tenant_id, ip, sucesso: true });
       // bcrypt (migrado do Supabase) ou scrypt com parâmetros antigos: regrava com os atuais agora que a senha em texto está disponível.

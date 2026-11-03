@@ -18,6 +18,7 @@
     "local:import": "tsx --env-file-if-exists=.env.import tools/importar-local.ts",
     "local:dump": "tsx tools/dump-local.ts",
     "local:seed": "tsx tools/seed-demo.ts",
+    "local:master": "tsx tools/criar-master-local.ts",
     "local:reset": "node -e \"require('fs').rmSync('.local-db',{recursive:true,force:true});console.log('banco local apagado')\"",
     "local:smoke": "tsx tools/smoke-local.ts"
   },

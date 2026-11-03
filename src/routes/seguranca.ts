@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import type { Deps } from "../deps.js";
 import { registrarAcao } from "../lib/auditoria-log.js";
+import { liberarLogin, listarTravamentos } from "../lib/limites.js";
 import { exigirMaster } from "../lib/perfil.js";
 
 type Checagem = {
@@ -78,7 +79,8 @@ export const segurancaRoutes =
       const { dias } = z.object({ dias: z.number().int().min(1).max(90).default(7) }).parse(req.body ?? {});
       await exigirMaster(db, req.auth.userId);
 
-      const [acessosRes, bloqueiosRes, cfgRes, perfisRes] = await Promise.all([
+      const [travados, acessosRes, bloqueiosRes, cfgRes, perfisRes] = await Promise.all([
+        listarTravamentos(db),
         db.query<{ ip: string | null; pais_regiao: string | null; sucesso: boolean; email_tentado: string | null; created_at: string }>(
           `SELECT ip, pais_regiao, sucesso, email_tentado, created_at FROM log_acessos
             WHERE created_at >= now() - make_interval(days => $1::int)
@@ -106,7 +108,7 @@ export const segurancaRoutes =
 
       const mapa = new Map<
         string,
-        { ip: string; falhas: number; sucessos: number; ultimaTentativa: string; regiao: string | null; emails: string[]; bloqueado: boolean }
+        { ip: string; falhas: number; sucessos: number; ultimaTentativa: string; regiao: string | null; emails: string[]; bloqueado: boolean; travado: boolean }
       >();
       for (const a of acessosRes.rows) {
         const ip = a.ip ?? "desconhecido";
@@ -118,6 +120,7 @@ export const segurancaRoutes =
           regiao: a.pais_regiao,
           emails: [] as string[],
           bloqueado: ipsBloqueados.has(ip),
+          travado: false,
         };
         if (a.sucesso) atual.sucessos += 1;
         else atual.falhas += 1;
@@ -127,6 +130,8 @@ export const segurancaRoutes =
         mapa.set(ip, atual);
       }
 
+      const ipsTravados = new Set(travados.filter((t) => t.tipo === "ip").map((t) => t.alvo));
+      for (const v of mapa.values()) v.travado = ipsTravados.has(v.ip);
       const ips = [...mapa.values()].sort((x, y) => y.falhas - x.falhas || y.sucessos - x.sucessos);
       const falhas = acessosRes.rows.filter((a) => !a.sucesso).length;
       const total = acessosRes.rows.length;
@@ -143,6 +148,7 @@ export const segurancaRoutes =
           ipsUnicos: mapa.size,
           ipsSuspeitos: ips.filter((i) => i.falhas >= 3).length,
           bloqueiosAtivos: bloqueios.filter((b) => b.ativo).length,
+          travadosAgora: travados.length,
           usuariosAtivos: perfis.filter((p) => p.ativo).length,
           usuariosInativos: perfis.filter((p) => !p.ativo).length,
           masters: perfis.filter((p) => p.role === "master_admin").length,
@@ -154,6 +160,7 @@ export const segurancaRoutes =
         },
         ips: ips.slice(0, 100),
         bloqueios,
+        travados,
       };
     });
 
@@ -185,10 +192,26 @@ export const segurancaRoutes =
       const { ip } = z.object({ ip: z.string().trim().min(3).max(64) }).parse(req.body);
       await exigirMaster(db, req.auth.userId);
       await db.tx(async (q) => {
-        await q.query("DELETE FROM ip_bloqueios WHERE ip = $1", [ip]);
-        await registrarAcao(q, req.auth.userId, "desbloqueou_ip", { ip });
+        // Também perdoa as falhas de login; senão o bloqueio automático voltaria na próxima tentativa.
+        const perdoadas = await liberarLogin(q, { ip });
+        await registrarAcao(q, req.auth.userId, "desbloqueou_ip", { ip, falhas_perdoadas: perdoadas });
       });
       return { ok: true as const };
+    });
+
+    /** Libera uma rede (IP) e/ou uma conta (e-mail) travada por senhas erradas. O histórico de acessos é mantido. */
+    app.post("/master/seguranca/ips/liberar", async (req) => {
+      const d = z
+        .object({ ip: z.string().trim().min(3).max(64).optional(), email: z.string().trim().email().max(255).optional() })
+        .refine((v) => v.ip || v.email, { message: "Informe a rede (IP) ou o e-mail a liberar." })
+        .parse(req.body);
+      await exigirMaster(db, req.auth.userId);
+      const perdoadas = await db.tx(async (q) => {
+        const n = await liberarLogin(q, d);
+        await registrarAcao(q, req.auth.userId, "liberou_login", { ip: d.ip ?? null, email: d.email ?? null, falhas_perdoadas: n });
+        return n;
+      });
+      return { ok: true as const, falhasPerdoadas: perdoadas };
     });
 
     /** Retenção mínima de dados pessoais (LGPD): expurga logs antigos. */

@@ -266,8 +266,10 @@ describe("sessão e módulos", () => {
     expect(masterOk.body).toMatchObject({ permitido: true, tenantNome: "Suporte Trizion" });
 
     await amb.db.query("UPDATE tenants SET status = 'inadimplente' WHERE id = $1", [t]);
+    // Hospital desativado: a sessão aberta deixa de valer (o front volta ao login, onde vê o aviso).
     const inativo = await chamar(amb.app, "POST", "/modulos/acesso", { token: adm, body: { chave: "giro_de_sala" } });
-    expect(inativo.body).toMatchObject({ permitido: false, motivo: "hospital_inativo" });
+    expect(inativo.status).toBe(401);
+    await amb.db.query("UPDATE tenants SET status = 'ativo' WHERE id = $1", [t]);
 
     const nomes = await chamar(amb.app, "GET", "/modulos/equipe-nomes", { token: op });
     expect(nomes.body.map((n: { nome: string }) => n.nome).sort()).toEqual(["adm", "op"]);

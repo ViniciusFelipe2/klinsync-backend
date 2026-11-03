@@ -65,13 +65,15 @@ export async function renovarSessao(db: Db, config: Config, refreshToken: string
     email: string;
     ativo: boolean | null;
   }>(
+    // `ativo` também fica falso quando o hospital do usuário está desativado (ver /auth/login).
     `SELECT t.id, t.usuario_id, t.familia, (t.expira_em < now()) AS expirado,
             (t.revogado_em IS NOT NULL) AS revogado,
             (t.rotacionado_em IS NOT NULL AND t.rotacionado_em > now() - make_interval(secs => $2::int)) AS "recemRotacionado",
-            u.email, p.ativo
+            u.email, (p.ativo AND (h.id IS NULL OR h.status = 'ativo')) AS ativo
        FROM refresh_tokens t
        JOIN usuarios u ON u.id = t.usuario_id
        LEFT JOIN usuarios_perfil p ON p.id = t.usuario_id
+       LEFT JOIN tenants h ON h.id = p.tenant_id
       WHERE t.token_hash = $1`,
     [hash, TOLERANCIA_ROTACAO_S],
   );

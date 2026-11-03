@@ -23,6 +23,8 @@ const ROTULO_ACAO: Record<string, string> = {
   criou_hospital: "Cadastrou hospital",
   atualizou_hospital: "Atualizou hospital",
   alterou_feature_flag: "Alterou feature do hospital",
+  alterou_status_hospital: "Alterou o status do hospital (ativar/desativar)",
+  excluiu_hospital: "Excluiu hospital",
   criou_usuario: "Criou usuário",
   criou_usuario_operacional: "Criou login operacional",
   resetou_senha: "Redefiniu senha",
@@ -35,6 +37,7 @@ const ROTULO_ACAO: Record<string, string> = {
   aceitou_convite: "Aceitou convite",
   bloqueou_ip: "Bloqueou IP",
   desbloqueou_ip: "Liberou IP",
+  liberou_login: "Liberou rede/conta travada por senhas erradas",
   purgou_logs: "Expurgou logs antigos (LGPD)",
 };
 

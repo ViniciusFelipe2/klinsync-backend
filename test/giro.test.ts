@@ -247,7 +247,7 @@ describe("módulo liberado no servidor", () => {
     expect((await chamar(amb.app, "POST", "/checkins/listar", { token: tc, body: {} })).status).toBe(403); // check-in não contratado
 
     await amb.db.query("UPDATE tenants SET status = 'inadimplente' WHERE id = $1", [t]);
-    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(403);
+    expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(401); // sessão cai junto com o hospital
     await amb.db.query("UPDATE tenants SET status = 'ativo' WHERE id = $1", [t]);
     await amb.db.query("UPDATE tenant_features SET habilitada = false WHERE tenant_id = $1", [t]);
     expect((await chamar(amb.app, "GET", "/giro/salas", { token: tc })).status).toBe(403);
@@ -294,6 +294,8 @@ describe("painel do hospital (giro, paradas, estatísticas e resumo)", () => {
     const limpeza = await chamar(amb.app, "POST", "/hospital/giro", { token: adm, body: { etapa: "limpeza", salaId: salaA2, pagina: 1, porPagina: 50 } });
     expect(limpeza.body.total).toBe(1);
     expect(limpeza.body.linhas[0]).toMatchObject({ tipo_evento: "limpeza", sala: "Sala 2", cirurgia_anterior: "Cirurgia X", cirurgia_proxima: "Cirurgia Y" });
+    expect(limpeza.body.linhas[0]).toHaveProperty("usuario_inicio");
+    expect(limpeza.body.linhas[0].usuario_inicio).toBeTruthy(); // nome (ou e-mail) de quem iniciou
     const invalida = await chamar(amb.app, "POST", "/hospital/giro", { token: adm, body: { salaId: "nao-e-uuid" } });
     expect(invalida.body).toEqual({ linhas: [], total: 0 });
   });
@@ -308,6 +310,92 @@ describe("painel do hospital (giro, paradas, estatísticas e resumo)", () => {
     const s2 = st.body.salas.find((s: { sala: string }) => s.sala === "Sala 2");
     expect(s2.ocorrencias).toBeGreaterThanOrEqual(2);
     expect(s2.medias["7"]).toBeGreaterThanOrEqual(0);
+  });
+
+  it("resumo por sala: totais e médias de enfermagem, limpeza e paradas, com linha de total", async () => {
+    const t = await criarHospital(amb.db, "Hospital Resumo");
+    await habilitarFeature(amb.db, t, "giro_de_sala");
+    const nova = async (nome: string) =>
+      (await amb.db.query<{ id: string }>("INSERT INTO salas (tenant_id, nome) VALUES ($1, $2) RETURNING id", [t, nome])).rows[0]!.id;
+    const s1 = await nova("Sala 01");
+    const s2 = await nova("Sala 02");
+    await criarUsuarioDireto(amb.db, { email: "adm-resumo@t.com", role: "hospital_admin", tenantId: t });
+    const admR = await tokenDe(amb.app, "adm-resumo@t.com");
+
+    const base = Date.now() - 6 * 3600_000;
+    const giro = (sala: string, tipo: string, iniMs: number, seg: number | null) =>
+      amb.db.query(
+        `INSERT INTO eventos_giro (sala_id, tipo_evento, inicio, fim, duracao_segundos, usuario_inicio_id) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [sala, tipo, new Date(iniMs), seg == null ? null : new Date(iniMs + seg * 1000), seg, opId],
+      );
+    // Sala 01: dois ciclos (40 min com 10 de limpeza; 30 min com 20 de limpeza)
+    await giro(s1, "desmontagem", base, 2400);
+    await giro(s1, "limpeza", base + 60_000, 600);
+    await giro(s1, "desmontagem", base + 3600_000, 1800);
+    await giro(s1, "limpeza", base + 3660_000, 1200);
+    // Sala 02: um ciclo de 20 min sem limpeza registrada + uma enfermagem em aberto (não entra)
+    await giro(s2, "desmontagem", base, 1200);
+    await giro(s2, "desmontagem", Date.now() - 60_000, null);
+    // limpeza de 10 s fora de ciclo: entra nos totais e é sinalizada para conferência (< 30 s)
+    await giro(s2, "limpeza", base + 2000_000, 10);
+    // paradas: uma finalizada de 15 min na Sala 02 e uma em aberto na Sala 01 (não entra no total)
+    await amb.db.query(
+      "INSERT INTO eventos_sala_parada (sala_id, inicio, fim, duracao_segundos, usuario_inicio_id) VALUES ($1, $2, $3, 900, $4)",
+      [s2, new Date(base), new Date(base + 900_000), opId],
+    );
+    await amb.db.query("INSERT INTO eventos_sala_parada (sala_id, inicio, usuario_inicio_id) VALUES ($1, $2, $3)", [s1, new Date(Date.now() - 600_000), opId]);
+
+    const r = await chamar(amb.app, "POST", "/hospital/giro/por-sala", { token: admR, body: {} });
+    expect(r.status).toBe(200);
+    const [a, b] = r.body.salas;
+    expect(a.nome).toBe("Sala 01");
+    expect(a.enfermagem).toEqual({ quantidade: 2, total: 2400, media: 1200 }); // 30 + 10 min líquidos
+    expect(a.limpeza).toEqual({ quantidade: 2, total: 1800, media: 900 });
+    expect(a.giroTotal).toEqual({ quantidade: 2, total: 4200, media: 2100 });
+    expect(a.paradas).toEqual({ quantidade: 0, total: 0, media: null });
+    expect(a.paradaDesde).not.toBeNull();
+    expect(b.enfermagem).toEqual({ quantidade: 1, total: 1200, media: 1200 });
+    expect(b.emAndamento).toMatchObject({ tipo: "desmontagem" });
+    expect(b.paradas).toEqual({ quantidade: 1, total: 900, media: 900 });
+    expect(r.body.total.enfermagem).toEqual({ quantidade: 3, total: 3600, media: 1200 });
+    expect(b.limpeza).toEqual({ quantidade: 1, total: 10, media: 10 });
+    expect(b.aRevisar).toBe(1);
+    expect(r.body.total.limpeza).toEqual({ quantidade: 3, total: 1810, media: 603 });
+    expect(r.body.indicadores).toEqual({
+      registros: 7,
+      concluidos: 6,
+      emAndamento: 1,
+      aRevisar: 1,
+      salasMonitoradas: 2,
+      limiteRevisaoSegundos: 30,
+    });
+    const somaDia = r.body.porDia.reduce((a: number, d: { total: number }) => a + d.total, 0);
+    expect(somaDia).toBe(7);
+    const conc = r.body.porDia.reduce(
+      (a: { e: number; l: number }, d: { enfermagemConcluidos: number; limpezaConcluidos: number }) => ({
+        e: a.e + d.enfermagemConcluidos,
+        l: a.l + d.limpezaConcluidos,
+      }),
+      { e: 0, l: 0 },
+    );
+    expect(conc).toEqual({ e: 3, l: 3 }); // o registro em aberto não entra nas médias do dia
+    const so1 = await chamar(amb.app, "POST", "/hospital/giro/por-sala", { token: admR, body: { salaId: s1 } });
+    const dias1 = so1.body.porDia.filter((d: { enfermagemConcluidos: number }) => d.enfermagemConcluidos > 0);
+    // Sala 01: ciclos de 30 e 10 min líquidos e limpezas de 10 e 20 min (mesmo dia salvo virada de data)
+    if (dias1.length === 1) {
+      expect(dias1[0]).toMatchObject({ enfermagemConcluidos: 2, mediaEnfermagem: 1200, limpezaConcluidos: 2, mediaLimpeza: 900 });
+    }
+    expect(r.body.total.paradas.total).toBe(900);
+    expect(r.body.periodo.de).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+
+    const so2 = await chamar(amb.app, "POST", "/hospital/giro/por-sala", { token: admR, body: { salaId: s2 } });
+    expect(so2.body.salas).toHaveLength(1);
+    expect(so2.body.total.enfermagem.quantidade).toBe(1);
+    // período sem eventos e isolamento: o admin do Hospital A não vê as salas do outro hospital
+    const vazio = await chamar(amb.app, "POST", "/hospital/giro/por-sala", { token: admR, body: { de: "2020-01-01", ate: "2020-01-31" } });
+    expect(vazio.body.total.enfermagem).toEqual({ quantidade: 0, total: 0, media: null });
+    const outro = await chamar(amb.app, "POST", "/hospital/giro/por-sala", { token: adm, body: { salaId: s1 } });
+    expect(outro.body.salas).toHaveLength(0);
   });
 
   it("resumo do hospital consolida usuários, salas, giro e acessos", async () => {

@@ -6,6 +6,7 @@ import { ZodError, z } from "zod";
 import { origensCors } from "./config.js";
 import type { Deps } from "./deps.js";
 import { HttpError, MSG_GENERICA, unauthorized } from "./errors.js";
+import { hospitalDoUsuarioDesativado } from "./lib/hospital.js";
 import { verificarAccessToken } from "./lib/tokens.js";
 import { authRoutes, authProtegidas } from "./routes/auth.js";
 import { auditoriaRoutes } from "./routes/auditoria.js";
@@ -124,6 +125,8 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
       } catch {
         throw unauthorized();
       }
+      // Hospital desativado: a sessão já aberta deixa de valer na hora (o front volta ao login, onde vê o aviso).
+      if (await hospitalDoUsuarioDesativado(db, req.auth.userId)) throw unauthorized();
     });
 
     avisarMutacoes(protegido, deps);

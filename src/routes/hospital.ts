@@ -24,6 +24,35 @@ type EventoGiro = {
 
 const segundosEntre = (inicio: string, fim: string) => Math.round((new Date(fim).getTime() - new Date(inicio).getTime()) / 1000);
 
+type Ciclo = { salaId: string; inicio: string; enfermagem: number; limpeza: number; geral: number };
+
+/**
+ * Monta os ciclos de giro a partir de eventos finalizados: cada enfermagem (desmontagem) é um ciclo;
+ * a limpeza que começou dentro dela é descontada da enfermagem (tempo líquido) e o geral é a soma.
+ */
+function montarCiclos(evs: EventoGiro[]): Ciclo[] {
+  const limpezas = evs.filter((e) => e.tipo_evento === "limpeza");
+  return evs
+    .filter((e) => e.tipo_evento === "desmontagem")
+    .map((enf) => {
+      const ini = new Date(enf.inicio).getTime();
+      const fim = enf.fim ? new Date(enf.fim).getTime() : ini;
+      const limpezaSeg = limpezas
+        .filter((l) => {
+          const li = new Date(l.inicio).getTime();
+          return l.sala_id === enf.sala_id && li >= ini && li <= fim;
+        })
+        .reduce((a, l) => a + (l.duracao_segundos ?? 0), 0);
+      const geral = enf.duracao_segundos ?? Math.round((fim - ini) / 1000);
+      return { salaId: enf.sala_id, inicio: enf.inicio, enfermagem: Math.max(0, geral - limpezaSeg), limpeza: limpezaSeg, geral };
+    });
+}
+
+/** Registros finalizados mais curtos que isso são sinalizados para conferência (possível falha de apontamento). */
+const LIMITE_REVISAO_SEG = 30;
+
+const mediaDe = (valores: number[]) => (valores.length === 0 ? null : Math.round(valores.reduce((a, b) => a + b, 0) / valores.length));
+
 export const hospitalRoutes =
   ({ db, config }: Deps): FastifyPluginAsync =>
   async (app) => {
@@ -172,10 +201,16 @@ export const hospitalRoutes =
           cirurgia_proxima: string | null;
           sala_id: string;
           sala_nome: string;
+          usuario_inicio: string | null;
+          usuario_fim: string | null;
         }>(
           `SELECT e.id, e.tipo_evento, e.inicio, e.fim, e.duracao_segundos, e.cirurgia_anterior, e.cirurgia_proxima,
-                  e.sala_id, s.nome AS sala_nome
-             FROM eventos_giro e JOIN salas s ON s.id = e.sala_id ${w.sql}
+                  e.sala_id, s.nome AS sala_nome,
+                  COALESCE(NULLIF(ui.nome, ''), ui.email) AS usuario_inicio,
+                  COALESCE(NULLIF(uf.nome, ''), uf.email) AS usuario_fim
+             FROM eventos_giro e JOIN salas s ON s.id = e.sala_id
+             LEFT JOIN usuarios_perfil ui ON ui.id = e.usuario_inicio_id
+             LEFT JOIN usuarios_perfil uf ON uf.id = e.usuario_fim_id ${w.sql}
             ORDER BY e.inicio DESC LIMIT $${w.proximo} OFFSET $${w.proximo + 1}`,
           [...w.params, d.porPagina, (d.pagina - 1) * d.porPagina],
         ),
@@ -219,6 +254,8 @@ export const hospitalRoutes =
             cirurgia_anterior: l.cirurgia_anterior ?? extra.anterior,
             cirurgia_proxima: l.cirurgia_proxima ?? extra.proxima,
             sala: l.sala_nome ?? "-",
+            usuario_inicio: l.usuario_inicio ?? null,
+            usuario_fim: l.usuario_fim ?? null,
           };
         }),
         total: total.rows[0]?.n ?? 0,
@@ -289,27 +326,7 @@ export const hospitalRoutes =
           [perfil.tenant_id, de, ate],
         )
       ).rows;
-      const enfermagens = evs.filter((e) => e.tipo_evento === "desmontagem");
-      const limpezas = evs.filter((e) => e.tipo_evento === "limpeza");
-
-      const ciclos = enfermagens.map((enf) => {
-        const ini = new Date(enf.inicio).getTime();
-        const fim = enf.fim ? new Date(enf.fim).getTime() : ini;
-        const limpezaSeg = limpezas
-          .filter((l) => {
-            const li = new Date(l.inicio).getTime();
-            return l.sala_id === enf.sala_id && li >= ini && li <= fim;
-          })
-          .reduce((a, l) => a + (l.duracao_segundos ?? 0), 0);
-        const geral = enf.duracao_segundos ?? Math.round((fim - ini) / 1000);
-        return {
-          dia: dataLocal(enf.inicio, tz),
-          inicio: enf.inicio,
-          enfermagem: Math.max(0, geral - limpezaSeg),
-          limpeza: limpezaSeg,
-          geral,
-        };
-      });
+      const ciclos = montarCiclos(evs).map((c) => ({ ...c, dia: dataLocal(c.inicio, tz) }));
 
       const medias = (chave: "enfermagem" | "limpeza" | "geral") =>
         ciclos.length === 0 ? null : Math.round(ciclos.reduce((a, c) => a + c[chave], 0) / ciclos.length);
@@ -366,6 +383,143 @@ export const hospitalRoutes =
           limpeza: Math.round((c.limpeza / 60) * 10) / 10,
           geral: Math.round((c.geral / 60) * 10) / 10,
         })),
+      };
+    });
+
+    /**
+     * Resumo do período por sala (o "resumão do mês"): para cada sala, quantidade, tempo total e média de
+     * enfermagem (líquida, sem a limpeza), de limpeza, giro total por ciclo e paradas, mais a linha de total.
+     * Regra: entram só eventos FINALIZADOS que começaram dentro do período; o que está em andamento
+     * aparece em `paradaDesde`/`emAndamento` (situação de agora), sem somar nos totais.
+     * `indicadores` conta os registros de giro do período (concluídos, em andamento e os < 30 s, a revisar)
+     * e `porDia` traz o volume de registros por data local do hospital.
+     */
+    app.post("/hospital/giro/por-sala", async (req) => {
+      const d = z
+        .object({ salaId: z.string().max(40).optional(), de: z.string().max(10).optional(), ate: z.string().max(10).optional() })
+        .parse(req.body ?? {});
+      const perfil = await exigirHospitalAdmin(db, req.auth.userId);
+      const t = perfil.tenant_id;
+      const { de, ate } = await limitesDoPeriodo(db, tz, dataValida(d.de), dataValida(d.ate), { dias: 30 });
+      const filtrarSala = !!d.salaId && d.salaId !== "todas";
+      const salaId = filtrarSala && ehUuid(d.salaId) ? d.salaId : null;
+      const periodo = { de: dataLocal(de, tz), ate: dataLocal(new Date(ate.getTime() - 1), tz) };
+
+      const [salas, registros, paradas, abertos] = await Promise.all([
+        db.query<{ id: string; nome: string; ativa: boolean; status_atual: string }>(
+          "SELECT id, nome, ativa, status_atual FROM salas WHERE tenant_id = $1 ORDER BY nome",
+          [t],
+        ),
+        db.query<EventoGiro>(
+          `SELECT e.id, e.sala_id, e.tipo_evento, e.inicio, e.fim, e.duracao_segundos
+             FROM eventos_giro e JOIN salas s ON s.id = e.sala_id
+            WHERE s.tenant_id = $1 AND e.inicio >= $2 AND e.inicio < $3
+            ORDER BY e.inicio ASC`,
+          [t, de, ate],
+        ),
+        db.query<{ sala_id: string; inicio: string; fim: string; duracao_segundos: number | null }>(
+          `SELECT p.sala_id, p.inicio, p.fim, p.duracao_segundos
+             FROM eventos_sala_parada p JOIN salas s ON s.id = p.sala_id
+            WHERE s.tenant_id = $1 AND p.inicio >= $2 AND p.inicio < $3 AND p.fim IS NOT NULL`,
+          [t, de, ate],
+        ),
+        db.query<{ sala_id: string; inicio: string; tipo: string }>(
+          `SELECT p.sala_id, p.inicio, 'parada' AS tipo FROM eventos_sala_parada p JOIN salas s ON s.id = p.sala_id
+            WHERE s.tenant_id = $1 AND p.fim IS NULL
+           UNION ALL
+           SELECT e.sala_id, e.inicio, e.tipo_evento::text AS tipo FROM eventos_giro e JOIN salas s ON s.id = e.sala_id
+            WHERE s.tenant_id = $1 AND e.fim IS NULL`,
+          [t],
+        ),
+      ]);
+
+      const evs = { rows: registros.rows.filter((e) => e.fim != null) }; // só finalizados entram nas somas
+      const ciclos = montarCiclos(evs.rows);
+      const limpezas = evs.rows.filter((e) => e.tipo_evento === "limpeza");
+      const durLimpeza = (e: EventoGiro) => e.duracao_segundos ?? (e.fim ? segundosEntre(e.inicio, e.fim) : 0);
+      const durEvento = (e: EventoGiro) => e.duracao_segundos ?? (e.fim ? segundosEntre(e.inicio, e.fim) : 0);
+      const durParada = (p: (typeof paradas.rows)[number]) => p.duracao_segundos ?? segundosEntre(p.inicio, p.fim);
+
+      const bloco = (valores: number[]) => {
+        const total = valores.reduce((a, b) => a + b, 0);
+        return { quantidade: valores.length, total, media: mediaDe(valores) };
+      };
+      const agregar = (filtro: (salaId: string) => boolean) => {
+        const cs = ciclos.filter((c) => filtro(c.salaId));
+        return {
+          enfermagem: bloco(cs.map((c) => c.enfermagem)),
+          limpeza: bloco(limpezas.filter((l) => filtro(l.sala_id)).map(durLimpeza)),
+          giroTotal: bloco(cs.map((c) => c.geral)),
+          paradas: bloco(paradas.rows.filter((p) => filtro(p.sala_id)).map(durParada)),
+          aRevisar: evs.rows.filter((e) => filtro(e.sala_id) && durEvento(e) < LIMITE_REVISAO_SEG).length,
+        };
+      };
+
+      const comMovimento = new Set([...registros.rows.map((e) => e.sala_id), ...paradas.rows.map((p) => p.sala_id)]);
+      const lista = salas.rows
+        .filter((s) => (filtrarSala ? s.id === salaId : s.ativa || comMovimento.has(s.id)))
+        .map((s) => {
+          const parada = abertos.rows.find((a) => a.sala_id === s.id && a.tipo === "parada");
+          const andamento = abertos.rows.find((a) => a.sala_id === s.id && a.tipo !== "parada");
+          return {
+            id: s.id,
+            nome: s.nome,
+            ativa: s.ativa,
+            statusAtual: s.status_atual,
+            paradaDesde: parada?.inicio ?? null,
+            emAndamento: andamento ? { tipo: andamento.tipo, desde: andamento.inicio } : null,
+            ...agregar((id) => id === s.id),
+          };
+        })
+        .sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR", { numeric: true }));
+
+      const ids = new Set(lista.map((s) => s.id));
+      const doFiltro = registros.rows.filter((e) => ids.has(e.sala_id));
+      const finalizados = doFiltro.filter((e) => e.fim != null);
+
+      // Por dia (data local do hospital): volume de registros (inclui em andamento) e, dos concluídos,
+      // quantidade e duração média de cada etapa (enfermagem líquida, como na tabela por sala).
+      type Dia = { enfermagem: number; limpeza: number; total: number; enf: number[]; lim: number[] };
+      const porDiaMap = new Map<string, Dia>();
+      const doDia = (dia: string) => {
+        const v = porDiaMap.get(dia) ?? { enfermagem: 0, limpeza: 0, total: 0, enf: [], lim: [] };
+        porDiaMap.set(dia, v);
+        return v;
+      };
+      for (const e of doFiltro) {
+        const v = doDia(dataLocal(e.inicio, tz));
+        if (e.tipo_evento === "desmontagem") v.enfermagem += 1;
+        else if (e.tipo_evento === "limpeza") v.limpeza += 1;
+        v.total += 1;
+      }
+      for (const c of ciclos.filter((c) => ids.has(c.salaId))) doDia(dataLocal(c.inicio, tz)).enf.push(c.enfermagem);
+      for (const l of limpezas.filter((l) => ids.has(l.sala_id))) doDia(dataLocal(l.inicio, tz)).lim.push(durEvento(l));
+      const porDia = [...porDiaMap.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([dia, v]) => ({
+          dia,
+          enfermagem: v.enfermagem,
+          limpeza: v.limpeza,
+          total: v.total,
+          enfermagemConcluidos: v.enf.length,
+          mediaEnfermagem: mediaDe(v.enf),
+          limpezaConcluidos: v.lim.length,
+          mediaLimpeza: mediaDe(v.lim),
+        }));
+
+      return {
+        periodo,
+        indicadores: {
+          registros: doFiltro.length,
+          concluidos: finalizados.length,
+          emAndamento: doFiltro.length - finalizados.length,
+          aRevisar: finalizados.filter((e) => durEvento(e) < LIMITE_REVISAO_SEG).length,
+          salasMonitoradas: lista.length,
+          limiteRevisaoSegundos: LIMITE_REVISAO_SEG,
+        },
+        salas: lista,
+        total: agregar((id) => ids.has(id)),
+        porDia,
       };
     });
 

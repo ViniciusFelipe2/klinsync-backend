@@ -13,7 +13,7 @@ import { criarUsuarioComPerfil } from "../lib/usuarios.js";
 const uuid = z.string().uuid();
 
 export const masterRoutes =
-  ({ db, externos }: Deps): FastifyPluginAsync =>
+  ({ db, externos, storage }: Deps): FastifyPluginAsync =>
   async (app) => {
     const exigirSenhaNaoVazada = async (senha: string) => {
       if (await externos.senhaFoiVazada(senha)) throw unprocessable(AVISO_SENHA_VAZADA);
@@ -82,6 +82,70 @@ export const masterRoutes =
       const novo = r.rows[0]!.id;
       await registrarAcao(db, req.auth.userId, "criou_hospital", { tenant_id: novo, ...campos });
       return { id: novo };
+    });
+
+    /** Desativa ("inativo"/"inadimplente") ou reativa um hospital. Quem é do hospital perde o acesso na hora. */
+    app.post("/master/hospitais/status", async (req) => {
+      const d = z.object({ id: uuid, status: z.enum(["ativo", "inativo", "inadimplente"]) }).parse(req.body);
+      await exigirMaster(db, req.auth.userId);
+      await db.tx(async (q) => {
+        const r = await q.query<{ nome: string }>("UPDATE tenants SET status = $1 WHERE id = $2 RETURNING nome", [d.status, d.id]);
+        if (r.rowCount === 0) throw notFound("Hospital não encontrado.");
+        if (d.status !== "ativo") {
+          // Impede que sessões abertas sejam renovadas.
+          await q.query(
+            `UPDATE refresh_tokens SET revogado_em = now()
+              WHERE revogado_em IS NULL AND usuario_id IN (SELECT id FROM usuarios_perfil WHERE tenant_id = $1)`,
+            [d.id],
+          );
+        }
+        await registrarAcao(q, req.auth.userId, "alterou_status_hospital", { tenant_id: d.id, nome: r.rows[0]!.nome, status: d.status });
+      });
+      return { ok: true as const };
+    });
+
+    /**
+     * Exclui o hospital e TUDO dele (salas, histórico de giro, check-ins, fotos, convites e os logins da equipe).
+     * Irreversível: só vale para hospital já desativado e com o nome digitado de volta.
+     */
+    app.post("/master/hospitais/excluir", async (req) => {
+      const d = z.object({ id: uuid, confirmarNome: z.string().max(160) }).parse(req.body);
+      await exigirMaster(db, req.auth.userId);
+
+      const hospital = (
+        await db.query<{ nome: string; cnpj: string | null; status: string }>("SELECT nome, cnpj, status FROM tenants WHERE id = $1", [d.id])
+      ).rows[0];
+      if (!hospital) throw notFound("Hospital não encontrado.");
+      if (hospital.status === "ativo") throw conflict("Desative o hospital antes de excluí-lo.");
+      const normalizar = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();
+      if (normalizar(d.confirmarNome) !== normalizar(hospital.nome)) throw unprocessable("O nome digitado não confere com o do hospital.");
+
+      const fotos = await db.tx(async (q) => {
+        const caminhos = (await q.query<{ photo_path: string }>("SELECT photo_path FROM check_ins WHERE tenant_id = $1", [d.id])).rows.map(
+          (x) => x.photo_path,
+        );
+        const usuarios = (await q.query<{ id: string }>("SELECT id FROM usuarios_perfil WHERE tenant_id = $1", [d.id])).rows.map((x) => x.id);
+        // As tabelas do hospital caem em cascata; o login (usuarios) é de outra cadeia e precisa sair junto, senão o e-mail fica preso.
+        await q.query("DELETE FROM tenants WHERE id = $1", [d.id]);
+        if (usuarios.length > 0) await q.query("DELETE FROM usuarios WHERE id = ANY($1::uuid[])", [usuarios]);
+        await registrarAcao(q, req.auth.userId, "excluiu_hospital", {
+          tenant_id: d.id,
+          nome: hospital.nome,
+          cnpj: hospital.cnpj,
+          usuarios_removidos: usuarios.length,
+          check_ins_removidos: caminhos.length,
+        });
+        return caminhos;
+      });
+
+      // Fotos no storage (dado pessoal, LGPD): depois do commit, em lotes. Falha de uma não desfaz a exclusão.
+      let naoRemovidas = 0;
+      for (let i = 0; i < fotos.length; i += 20) {
+        const lote = await Promise.allSettled(fotos.slice(i, i + 20).map((p) => storage.remove(p)));
+        naoRemovidas += lote.filter((r) => r.status === "rejected").length;
+      }
+      if (naoRemovidas > 0) req.log.warn({ tenantId: d.id, naoRemovidas }, "fotos do hospital excluído não foram removidas do storage");
+      return { ok: true as const, fotosNaoRemovidas: naoRemovidas };
     });
 
     app.post("/master/features/alternar", async (req) => {
