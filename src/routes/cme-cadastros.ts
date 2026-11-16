@@ -18,12 +18,22 @@ import { TAMANHO_MAX_MM, TAMANHO_MIN_MM, avaliarCodigo, matrizDoConteudo } from 
 
 const uuid = z.string().uuid();
 const rotulo = z.string().trim().min(2).max(120);
-const tipoCaixa = z.enum(["casa", "consignada"]);
+const tipoCaixa = z.enum(["casa", "consignada", "medica"]);
 const descricao = z.string().trim().max(300).optional();
+const medicoNome = z.string().trim().max(120).optional();
+const totalItens = z.number().int().min(1).max(500).optional();
+
+/** Caixa médica exige o nome do médico e o total de itens; nos outros tipos os dois são descartados. */
+const dadosDaCaixa = <T extends { tipoCaixa: z.infer<typeof tipoCaixa>; medicoNome?: string | undefined; totalItens?: number | undefined }>(d: T) => {
+  if (d.tipoCaixa !== "medica") return { medicoNome: null, totalItens: null };
+  if (!d.medicoNome || d.medicoNome.length < 2) throw unprocessable("Informe o nome do médico dono da caixa.");
+  if (!d.totalItens) throw unprocessable("Informe quantos itens a caixa tem no total.");
+  return { medicoNome: d.medicoNome, totalItens: d.totalItens };
+};
 const codigoGravado = z.string().max(500).optional();
 const tamanhoMm = z.number().min(TAMANHO_MIN_MM).max(TAMANHO_MAX_MM);
 
-type CaixaLinha = CodigoLinha & { tipo_caixa: "casa" | "consignada"; descricao: string | null };
+type CaixaLinha = CodigoLinha & { tipo_caixa: "casa" | "consignada" | "medica"; descricao: string | null; medico_nome: string | null; total_itens: number | null };
 type ItemLinha = CodigoLinha & { caixa_id: string | null };
 type ColaboradorLinha = { id: string; nome: string; numero_cracha: string; perfil: "cme" | "sala"; ativo: boolean; created_at: string };
 
@@ -68,7 +78,7 @@ export const cmeCadastrosRoutes =
 
       const [caixas, itens] = await Promise.all([
         db.query<CaixaLinha>(
-          `SELECT ${COLUNAS_CODIGO_C}, cx.tipo_caixa, cx.descricao FROM cme_caixas cx JOIN cme_codigos c ON c.id = cx.codigo_id
+          `SELECT ${COLUNAS_CODIGO_C}, cx.tipo_caixa, cx.descricao, cx.medico_nome, cx.total_itens FROM cme_caixas cx JOIN cme_codigos c ON c.id = cx.codigo_id
             WHERE ($1::uuid IS NULL OR cx.tenant_id = $1) AND ($2 OR c.ativo) ORDER BY c.rotulo, c.id`,
           [tenantId, comInativos],
         ),
@@ -92,22 +102,25 @@ export const cmeCadastrosRoutes =
         tamanhoMm: tamanho,
         // A busca acha a caixa pelo nome dela ou pelo de qualquer item; a caixa aparece sempre com todos os itens.
         caixas: caixas.rows
-          .filter((cx) => bate(cx) || (porCaixa.get(cx.id) ?? []).some(bate))
+          .filter((cx) => bate(cx) || (!!termo && !!cx.medico_nome?.toLowerCase().includes(termo)) || (porCaixa.get(cx.id) ?? []).some(bate))
           .map((cx) => ({ ...comAvaliacao(cx), itens: (porCaixa.get(cx.id) ?? []).map(comAvaliacao) })),
         semCaixa: itens.rows.filter((i) => !i.caixa_id && bate(i)).map(comAvaliacao),
       };
     });
 
     app.post("/cme/caixas/criar", async (req) => {
-      const d = z.object({ rotulo, tipoCaixa, descricao, codigoGravado }).parse(req.body);
+      const d = z.object({ rotulo, tipoCaixa, descricao, codigoGravado, medicoNome, totalItens }).parse(req.body);
       const { tenantId, perfil } = await exigirChefeCme(db, req.auth.userId);
+      const medica = dadosDaCaixa(d);
       return db.tx(async (q) => {
         const c = await criarCodigo(q, { tenantId, usuarioId: perfil.id, ip: req.ip, tipo: "caixa", rotulo: d.rotulo, codigoGravado: d.codigoGravado });
-        await q.query("INSERT INTO cme_caixas (codigo_id, tenant_id, tipo_caixa, descricao) VALUES ($1, $2, $3, $4)", [
+        await q.query("INSERT INTO cme_caixas (codigo_id, tenant_id, tipo_caixa, descricao, medico_nome, total_itens) VALUES ($1, $2, $3, $4, $5, $6)", [
           c.id,
           tenantId,
           d.tipoCaixa,
           d.descricao || null,
+          medica.medicoNome,
+          medica.totalItens,
         ]);
         await auditarCme(q, { tenantId, usuarioId: perfil.id, ip: req.ip, acao: "cme_caixa_criada", detalhes: { id: c.id, tipoCaixa: d.tipoCaixa } });
         return c;
@@ -115,15 +128,14 @@ export const cmeCadastrosRoutes =
     });
 
     app.post("/cme/caixas/editar", async (req) => {
-      const d = z.object({ id: uuid, rotulo, tipoCaixa, descricao }).parse(req.body);
+      const d = z.object({ id: uuid, rotulo, tipoCaixa, descricao, medicoNome, totalItens }).parse(req.body);
       const { tenantId, perfil } = await exigirChefeCme(db, req.auth.userId);
+      const medica = dadosDaCaixa(d);
       await db.tx(async (q) => {
-        const r = await q.query("UPDATE cme_caixas SET tipo_caixa = $3, descricao = $4 WHERE codigo_id = $1 AND tenant_id = $2", [
-          d.id,
-          tenantId,
-          d.tipoCaixa,
-          d.descricao || null,
-        ]);
+        const r = await q.query(
+          "UPDATE cme_caixas SET tipo_caixa = $3, descricao = $4, medico_nome = $5, total_itens = $6 WHERE codigo_id = $1 AND tenant_id = $2",
+          [d.id, tenantId, d.tipoCaixa, d.descricao || null, medica.medicoNome, medica.totalItens],
+        );
         if (r.rowCount === 0) throw notFound("Caixa não encontrada.");
         await q.query("UPDATE cme_codigos SET rotulo = $3 WHERE id = $1 AND tenant_id = $2", [d.id, tenantId, d.rotulo]);
         await auditarCme(q, { tenantId, usuarioId: perfil.id, ip: req.ip, acao: "cme_caixa_editada", detalhes: { id: d.id } });

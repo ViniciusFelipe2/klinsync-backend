@@ -13,6 +13,7 @@ import { auditoriaRoutes } from "./routes/auditoria.js";
 import { checkinsRoutes } from "./routes/checkins.js";
 import { cmeRoutes } from "./routes/cme.js";
 import { cmeCadastrosRoutes } from "./routes/cme-cadastros.js";
+import { cmeOperacaoRoutes } from "./routes/cme-operacao.js";
 import { cmeSalaRoutes } from "./routes/cme-sala.js";
 import { conviteRoutesProtegidas, conviteRoutesPublicas } from "./routes/convites.js";
 import { avisarMutacoes, eventosRoutes } from "./routes/eventos.js";
@@ -146,6 +147,7 @@ export async function buildApp(deps: Deps): Promise<FastifyInstance> {
     await protegido.register(cmeRoutes(deps));
     await protegido.register(cmeCadastrosRoutes(deps));
     await protegido.register(cmeSalaRoutes(deps));
+    await protegido.register(cmeOperacaoRoutes(deps));
     await protegido.register(observabilidadeRoutes(deps));
     await protegido.register(eventosRoutes(deps));
   });

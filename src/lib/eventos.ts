@@ -1,6 +1,6 @@
 import type { Db } from "../db/index.js";
 
-export type TipoEvento = "giro" | "reserva" | "checkin" | "salas";
+export type TipoEvento = "giro" | "reserva" | "checkin" | "salas" | "cme";
 
 /** Aviso de "algo mudou" (sem dados sensíveis): o cliente apenas busca de novo o que está na tela. */
 export type EventoTempoReal = { tipo: TipoEvento; tenantId: string | null };

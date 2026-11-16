@@ -4,7 +4,7 @@ import { LIMITES_PADRAO, TAMANHO_PADRAO_MM, gerarCodigoCurto, matrizDoConteudo, 
 import { exigirModulo } from "./modulo.js";
 import type { Perfil } from "./perfil.js";
 
-export type TipoContaCme = "chefe" | "colaborador" | "estacao_sala" | "painel_setor";
+export type TipoContaCme = "chefe" | "colaborador" | "estacao_sala" | "painel_setor" | "estacao_cme";
 
 export type AcessoCme = { perfil: Perfil; tenantId: string | null; tipo: TipoContaCme | null; salaId: string | null };
 
@@ -21,10 +21,10 @@ export async function acessoCme(q: Queryable, userId: string): Promise<AcessoCme
   return { perfil, tenantId, tipo: conta.tipo, salaId: conta.sala_id };
 }
 
-/** Consultas dos cadastros e relatórios. Computador de sala e TV de setor não enxergam estes dados. */
+/** Consultas dos cadastros e relatórios. Computadores de sala e do CME e a TV de setor não enxergam estes dados. */
 export async function exigirLeituraCme(q: Queryable, userId: string): Promise<AcessoCme> {
   const acesso = await acessoCme(q, userId);
-  if (acesso.tipo === "estacao_sala" || acesso.tipo === "painel_setor") throw forbidden();
+  if (acesso.tipo === "estacao_sala" || acesso.tipo === "estacao_cme" || acesso.tipo === "painel_setor") throw forbidden();
   return acesso;
 }
 
@@ -47,6 +47,23 @@ export async function exigirEstacaoSala(q: Queryable, userId: string): Promise<A
   const acesso = await acessoCme(q, userId);
   if (acesso.tipo !== "estacao_sala" || !acesso.tenantId || !acesso.salaId) throw forbidden("Esta tela só abre no computador da sala cirúrgica.");
   return acesso as AcessoCme & { tenantId: string; salaId: string };
+}
+
+export type Estacao = AcessoCme & { tenantId: string; tipo: "estacao_sala" | "estacao_cme" };
+
+/** Telas de crachá: o computador de uma sala cirúrgica ou o computador do CME. */
+export async function exigirEstacao(q: Queryable, userId: string): Promise<Estacao> {
+  const acesso = await acessoCme(q, userId);
+  const sala = acesso.tipo === "estacao_sala" && !!acesso.salaId;
+  if ((!sala && acesso.tipo !== "estacao_cme") || !acesso.tenantId) throw forbidden("Esta tela só abre no computador da sala cirúrgica ou do CME.");
+  return acesso as Estacao;
+}
+
+/** Telas de dentro do CME (expurgo, preparo, esterilização): só o computador do CME. */
+export async function exigirEstacaoCme(q: Queryable, userId: string): Promise<Estacao> {
+  const acesso = await exigirEstacao(q, userId);
+  if (acesso.tipo !== "estacao_cme") throw forbidden("Esta tela só abre no computador do CME.");
+  return acesso;
 }
 
 export type ConfigCme = LimitesLeitura & {
@@ -176,4 +193,78 @@ const MIN_TECLAS_PARA_MEDIR = 4;
 export function pareceLeitor(duracaoMs: number | undefined, teclas: number | undefined): boolean {
   if (duracaoMs === undefined || teclas === undefined || teclas < MIN_TECLAS_PARA_MEDIR) return false;
   return duracaoMs / (teclas - 1) < MS_POR_TECLA_DO_LEITOR;
+}
+
+/* ---------------------------------------- Onde a caixa está ---------------------------------------- */
+
+export type SetorCaixa = "sala" | "expurgo" | "preparo" | "esterilizacao" | "arsenal";
+export type StatusCaixa = "sem_movimento" | "sala" | "expurgo" | "preparo" | "esterilizacao" | "arsenal";
+
+/**
+ * Status da caixa: o último setor em que foi bipada (cme_caixas cx). "sala" é a caixa contaminada, bipada na sala cirúrgica.
+ * A esterilização é um status só, do bip na máquina até a confirmação do arsenal: o andamento do ciclo aparece na máquina.
+ */
+export const SQL_STATUS_CAIXA = "COALESCE(cx.local, 'sem_movimento')";
+
+/**
+ * Registra que a caixa foi bipada em um setor. O status só muda quando o lugar muda:
+ * bipar de novo no mesmo setor (retomar a conferência, por exemplo) não mexe na hora nem no histórico.
+ */
+export async function moverCaixa(
+  q: Queryable,
+  a: { tenantId: string; caixaId: string; setor: SetorCaixa; salaId?: string | null; cargaId?: string | null; colaboradorId: string; estacaoId: string },
+): Promise<void> {
+  const salaId = a.setor === "sala" ? (a.salaId ?? null) : null;
+  const cargaId = a.setor === "esterilizacao" ? (a.cargaId ?? null) : null;
+  const atual = (
+    await q.query<{ local: string | null; local_sala_id: string | null; local_carga_id: string | null }>(
+      "SELECT local, local_sala_id, local_carga_id FROM cme_caixas WHERE codigo_id = $1 AND tenant_id = $2 FOR UPDATE",
+      [a.caixaId, a.tenantId],
+    )
+  ).rows[0];
+  if (!atual) return;
+  if (atual.local === a.setor && atual.local_sala_id === salaId && atual.local_carga_id === cargaId) return;
+  // Saiu de uma carga que ainda estava sendo montada: ela não vai mais naquele ciclo.
+  if (atual.local_carga_id && atual.local_carga_id !== cargaId) {
+    await q.query(
+      "DELETE FROM cme_carga_caixas WHERE carga_id = $1 AND caixa_id = $2 AND EXISTS (SELECT 1 FROM cme_cargas g WHERE g.id = $1 AND g.status = 'montando')",
+      [atual.local_carga_id, a.caixaId],
+    );
+  }
+  await q.query("UPDATE cme_caixas SET local = $2, local_desde = now(), local_sala_id = $3, local_carga_id = $4 WHERE codigo_id = $1", [
+    a.caixaId,
+    a.setor,
+    salaId,
+    cargaId,
+  ]);
+  await q.query("INSERT INTO cme_movimentos (tenant_id, caixa_id, setor, sala_id, carga_id, colaborador_id, estacao_id) VALUES ($1, $2, $3, $4, $5, $6, $7)", [
+    a.tenantId,
+    a.caixaId,
+    a.setor,
+    salaId,
+    cargaId,
+    a.colaboradorId,
+    a.estacaoId,
+  ]);
+}
+
+/**
+ * A caixa saiu da esterilização sem passar pelo ciclo (retirada da carga, ou carga cancelada em teste):
+ * volta para o último setor em que esteve antes da máquina. Sem setor anterior, fica "sem movimentação".
+ */
+export async function devolverCaixa(q: Queryable, a: { tenantId: string; caixaId: string; colaboradorId: string; estacaoId: string }): Promise<void> {
+  const anterior = (
+    await q.query<{ setor: SetorCaixa; sala_id: string | null }>(
+      "SELECT setor, sala_id FROM cme_movimentos WHERE caixa_id = $1 AND tenant_id = $2 AND setor <> 'esterilizacao' ORDER BY created_at DESC LIMIT 1",
+      [a.caixaId, a.tenantId],
+    )
+  ).rows[0];
+  if (anterior) {
+    await moverCaixa(q, { ...a, setor: anterior.setor, salaId: anterior.sala_id });
+    return;
+  }
+  await q.query("UPDATE cme_caixas SET local = NULL, local_desde = NULL, local_sala_id = NULL, local_carga_id = NULL WHERE codigo_id = $1 AND tenant_id = $2", [
+    a.caixaId,
+    a.tenantId,
+  ]);
 }

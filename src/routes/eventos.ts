@@ -17,6 +17,16 @@ function tipoDaMutacao(url: string): TipoEvento | null {
   if (rota === "/giro/reservas/reservar" || rota === "/giro/reservas/liberar") return "reserva";
   if (rota === "/checkins" || rota === "/checkins/excluir") return "checkin";
   if (rota === "/hospital/salas/salvar" || rota === "/master/salas/salvar" || rota === "/master/salas/excluir") return "salas";
+  // CME: o bip da caixa (em qualquer setor), tudo o que mexe em uma carga e os cadastros que aparecem no painel.
+  if (
+    rota === "/cme/sala/caixa" ||
+    rota.startsWith("/cme/esterilizacao/carga/") ||
+    rota === "/cme/maquinas/salvar" ||
+    rota.startsWith("/cme/caixas/") ||
+    rota === "/cme/codigos/situacao"
+  ) {
+    return "cme";
+  }
   return null;
 }
 

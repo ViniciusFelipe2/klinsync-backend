@@ -362,7 +362,7 @@ describe("rotas do CME", () => {
     await outro.db.query("CREATE TABLE IF NOT EXISTS schema_migrations (filename text PRIMARY KEY)");
     const pg = outro.db as unknown as { query: (s: string) => Promise<unknown> };
     // Desfaz da mais nova para a mais antiga, como deve ser feito no servidor.
-    for (const arquivo of ["0010_cme_conferencias.down.sql", "0009_cme_cadastros.down.sql", "0008_cme_codigos.down.sql"]) {
+    for (const arquivo of ["0014_cme_caixa_sem_maquina.down.sql", "0013_cme_arsenal.down.sql", "0012_cme_operacao.down.sql", "0011_cme_caixa_medica.down.sql", "0010_cme_conferencias.down.sql", "0009_cme_cadastros.down.sql", "0008_cme_codigos.down.sql"]) {
       const down = readFileSync(join(aqui, "db", "down", arquivo), "utf8")
         .replace(/^--.*$/gm, "")
         .split(";")

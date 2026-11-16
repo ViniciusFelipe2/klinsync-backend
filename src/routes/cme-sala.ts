@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Queryable } from "../db/index.js";
 import type { Deps } from "../deps.js";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
-import { auditarCme, configCme, exigirEstacaoSala, normalizarCracha, pareceLeitor } from "../lib/cme.js";
+import { auditarCme, configCme, exigirEstacao, moverCaixa, normalizarCracha, pareceLeitor, type Estacao } from "../lib/cme.js";
 import { sha256Hex, tokenAleatorio } from "../lib/crypto.js";
 import { normalizarLeitura } from "../lib/datamatrix.js";
 import { limitarTentativas } from "../lib/limites.js";
@@ -18,50 +18,59 @@ const TENTATIVAS_DE_CRACHA_POR_MINUTO = 20;
  * Sessão de crachá vencida ou recusada responde 422, e não 401: o 401 faria a tela derrubar
  * o login do próprio computador da sala, que continua válido.
  */
-const sessaoEncerrada = () => new HttpError(422, "Sua sessão terminou. Bipe o crachá de novo.", { sessaoEncerrada: true });
+export const sessaoEncerrada = () => new HttpError(422, "Sua sessão terminou. Bipe o crachá de novo.", { sessaoEncerrada: true });
 
-type Sessao = { id: string; colaborador_id: string; nome: string; numero_cracha: string; perfil: string };
+export type Sessao = { id: string; colaborador_id: string; nome: string; numero_cracha: string; perfil: string };
 
-const leituraSchema = {
+export const leituraSchema = {
   duracaoMs: z.number().int().min(0).max(3_600_000).optional(),
   teclas: z.number().int().min(0).max(1000).optional(),
   digitado: z.boolean().default(false),
 };
 
+/**
+ * Confere o token do crachá (do computador desta sala, aberto e dentro do prazo) e renova o prazo de inatividade.
+ * Chame fora de transação: o registro de "saiu por inatividade" precisa ficar gravado mesmo com o erro que vem depois.
+ */
+export const sessaoValida = async (q: Queryable, estacaoId: string, token: string): Promise<Sessao> => {
+  const r = await q.query<Sessao & { vencida: boolean }>(
+    `SELECT s.id, s.colaborador_id, c.nome, c.numero_cracha, c.perfil,
+            (s.ultimo_uso < now() - make_interval(mins => $3::int) OR s.criada_em < now() - make_interval(hours => $4::int)) AS vencida
+       FROM cme_sessoes_cracha s JOIN cme_colaboradores c ON c.id = s.colaborador_id
+      WHERE s.token_hash = $1 AND s.estacao_id = $2 AND s.encerrada_em IS NULL AND c.ativo`,
+    [sha256Hex(token), estacaoId, INATIVIDADE_CRACHA_MIN, DURACAO_MAXIMA_CRACHA_H],
+  );
+  const s = r.rows[0];
+  if (!s) throw sessaoEncerrada();
+  if (s.vencida) {
+    await q.query("UPDATE cme_sessoes_cracha SET encerrada_em = now(), motivo_fim = 'inatividade' WHERE id = $1", [s.id]);
+    throw sessaoEncerrada();
+  }
+  await q.query("UPDATE cme_sessoes_cracha SET ultimo_uso = now() WHERE id = $1", [s.id]);
+  return s;
+};
+
+const setorCme = z.enum(["expurgo", "preparo"]).optional();
+
+/** Setor da conferência: no computador da sala é sempre a sala; no do CME, o setor que o colaborador escolheu. */
+const setorDaConferencia = (estacao: Estacao, setor: "expurgo" | "preparo" | undefined): "sala" | "expurgo" | "preparo" => {
+  if (estacao.tipo === "estacao_sala") return "sala";
+  if (!setor) throw unprocessable("Escolha o setor (expurgo ou preparo) antes de bipar.");
+  return setor;
+};
+
 export const cmeSalaRoutes =
   ({ db }: Deps): FastifyPluginAsync =>
   async (app) => {
-    /**
-     * Confere o token do crachá (do computador desta sala, aberto e dentro do prazo) e renova o prazo de inatividade.
-     * Chame fora de transação: o registro de "saiu por inatividade" precisa ficar gravado mesmo com o erro que vem depois.
-     */
-    const sessaoValida = async (q: Queryable, estacaoId: string, token: string): Promise<Sessao> => {
-      const r = await q.query<Sessao & { vencida: boolean }>(
-        `SELECT s.id, s.colaborador_id, c.nome, c.numero_cracha, c.perfil,
-                (s.ultimo_uso < now() - make_interval(mins => $3::int) OR s.criada_em < now() - make_interval(hours => $4::int)) AS vencida
-           FROM cme_sessoes_cracha s JOIN cme_colaboradores c ON c.id = s.colaborador_id
-          WHERE s.token_hash = $1 AND s.estacao_id = $2 AND s.encerrada_em IS NULL AND c.ativo`,
-        [sha256Hex(token), estacaoId, INATIVIDADE_CRACHA_MIN, DURACAO_MAXIMA_CRACHA_H],
-      );
-      const s = r.rows[0];
-      if (!s) throw sessaoEncerrada();
-      if (s.vencida) {
-        await q.query("UPDATE cme_sessoes_cracha SET encerrada_em = now(), motivo_fim = 'inatividade' WHERE id = $1", [s.id]);
-        throw sessaoEncerrada();
-      }
-      await q.query("UPDATE cme_sessoes_cracha SET ultimo_uso = now() WHERE id = $1", [s.id]);
-      return s;
-    };
-
     const resposta = (s: Sessao) => ({
       colaborador: { id: s.colaborador_id, nome: s.nome, numeroCracha: s.numero_cracha, perfil: s.perfil },
       inatividadeMin: INATIVIDADE_CRACHA_MIN,
     });
 
-    /** Login por crachá. Só funciona no computador da sala, já logado; o crachá sozinho não abre nada pela internet. */
+    /** Login por crachá. Só funciona no computador da sala ou do CME, já logado; o crachá sozinho não abre nada pela internet. */
     app.post("/cme/sala/entrar", async (req) => {
       const d = z.object({ cracha: z.string().max(100), ...leituraSchema }).parse(req.body);
-      const { tenantId, salaId, perfil } = await exigirEstacaoSala(db, req.auth.userId);
+      const { tenantId, salaId, perfil } = await exigirEstacao(db, req.auth.userId);
       await limitarTentativas(db, `cme-cracha:${perfil.id}`, TENTATIVAS_DE_CRACHA_POR_MINUTO, 60_000, "Muitas tentativas de crachá. Aguarde um minuto.");
 
       const cfg = await configCme(db, tenantId);
@@ -106,13 +115,13 @@ export const cmeSalaRoutes =
 
     app.post("/cme/sala/sessao", async (req) => {
       const { token } = z.object({ token: z.string().min(10).max(200) }).parse(req.body);
-      const { perfil } = await exigirEstacaoSala(db, req.auth.userId);
+      const { perfil } = await exigirEstacao(db, req.auth.userId);
       return resposta(await sessaoValida(db, perfil.id, token));
     });
 
     app.post("/cme/sala/sair", async (req) => {
       const d = z.object({ token: z.string().min(10).max(200), motivo: z.enum(["manual", "inatividade"]).default("manual") }).parse(req.body);
-      const { tenantId, perfil, salaId } = await exigirEstacaoSala(db, req.auth.userId);
+      const { tenantId, perfil, salaId } = await exigirEstacao(db, req.auth.userId);
       await db.tx(async (q) => {
         const r = await q.query<{ id: string; colaborador_id: string }>(
           `UPDATE cme_sessoes_cracha SET encerrada_em = now(), motivo_fim = $3
@@ -130,9 +139,11 @@ export const cmeSalaRoutes =
     /** Bipou a caixa: devolve os itens que devem estar nela (o gabarito). */
     app.post("/cme/sala/caixa", async (req) => {
       const d = z
-        .object({ token: z.string().min(10).max(200), texto: z.string().max(500), textoVisivel: z.string().max(2000).optional(), motivo: z.string().trim().max(300).optional(), ...leituraSchema })
+        .object({ token: z.string().min(10).max(200), texto: z.string().max(500), textoVisivel: z.string().max(2000).optional(), motivo: z.string().trim().max(300).optional(), setor: setorCme, ...leituraSchema })
         .parse(req.body);
-      const { tenantId, perfil, salaId } = await exigirEstacaoSala(db, req.auth.userId);
+      const estacao = await exigirEstacao(db, req.auth.userId);
+      const { tenantId, perfil, salaId } = estacao;
+      const setor = setorDaConferencia(estacao, d.setor);
       await limitarTentativas(db, `cme-leitura:${perfil.id}`, 300, 60_000);
       const normalizado = normalizarLeitura(d.texto);
       if (!normalizado) throw unprocessable("Nenhum código foi recebido.");
@@ -142,15 +153,15 @@ export const cmeSalaRoutes =
       // A leitura fica gravada mesmo quando a caixa não existe: o erro só sai depois da transação.
       const r = await db.tx(async (q) => {
         const caixa = (
-          await q.query<{ id: string; rotulo: string; codigo: string; tipo_caixa: string }>(
-            `SELECT c.id, c.rotulo, c.codigo, cx.tipo_caixa FROM cme_caixas cx JOIN cme_codigos c ON c.id = cx.codigo_id
+          await q.query<{ id: string; rotulo: string; tipo_caixa: string; medico_nome: string | null }>(
+            `SELECT c.id, c.rotulo, cx.tipo_caixa, cx.medico_nome FROM cme_caixas cx JOIN cme_codigos c ON c.id = cx.codigo_id
               WHERE cx.tenant_id = $1 AND c.codigo = $2 AND c.ativo`,
             [tenantId, normalizado],
           )
         ).rows[0];
         await q.query(
           `INSERT INTO cme_leituras (tenant_id, codigo_id, usuario_id, colaborador_id, origem, resultado, texto_bruto, texto_normalizado, duracao_ms, motivo, tela, ip)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'sala_caixa', $11)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $12, $11)`,
           [
             tenantId,
             caixa?.id ?? null,
@@ -163,24 +174,27 @@ export const cmeSalaRoutes =
             d.duracaoMs ?? null,
             d.motivo ?? null,
             req.ip,
+            `${setor}_caixa`,
           ],
         );
         if (!caixa) return null;
+        // O bip da caixa é o que muda o status dela.
+        await moverCaixa(q, { tenantId, caixaId: caixa.id, setor, salaId, colaboradorId: sessao.colaborador_id, estacaoId: perfil.id });
 
         // Retoma a conferência que ficou aberta neste computador para esta caixa, ou começa uma nova.
         let conferencia = (
           await q.query<{ id: string }>(
-            "SELECT id FROM cme_conferencias WHERE estacao_id = $1 AND caixa_id = $2 AND status = 'em_andamento' ORDER BY iniciada_em DESC LIMIT 1",
-            [perfil.id, caixa.id],
+            "SELECT id FROM cme_conferencias WHERE estacao_id = $1 AND caixa_id = $2 AND setor = $3 AND status = 'em_andamento' ORDER BY iniciada_em DESC LIMIT 1",
+            [perfil.id, caixa.id, setor],
           )
         ).rows[0];
         if (!conferencia) {
           const esperados = await q.query("SELECT 1 FROM cme_caixa_itens ci JOIN cme_codigos c ON c.id = ci.item_id WHERE ci.caixa_id = $1 AND c.ativo", [caixa.id]);
           conferencia = (
             await q.query<{ id: string }>(
-              `INSERT INTO cme_conferencias (tenant_id, caixa_id, estacao_id, sala_id, colaborador_id, itens_esperados)
-               VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-              [tenantId, caixa.id, perfil.id, salaId, sessao.colaborador_id, esperados.rowCount],
+              `INSERT INTO cme_conferencias (tenant_id, caixa_id, estacao_id, sala_id, colaborador_id, itens_esperados, setor)
+               VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+              [tenantId, caixa.id, perfil.id, salaId, sessao.colaborador_id, esperados.rowCount, setor],
             )
           ).rows[0]!;
           await auditarCme(q, {
@@ -188,12 +202,13 @@ export const cmeSalaRoutes =
             usuarioId: perfil.id,
             ip: req.ip,
             acao: "cme_conferencia_iniciada",
-            detalhes: { conferenciaId: conferencia.id, caixaId: caixa.id, colaboradorId: sessao.colaborador_id, salaId },
+            detalhes: { conferenciaId: conferencia.id, caixaId: caixa.id, colaboradorId: sessao.colaborador_id, salaId, setor },
           });
         }
         return {
           conferenciaId: conferencia.id,
-          caixa: { id: caixa.id, rotulo: caixa.rotulo, codigo: caixa.codigo, tipoCaixa: caixa.tipo_caixa },
+          setor,
+          caixa: { id: caixa.id, rotulo: caixa.rotulo, tipoCaixa: caixa.tipo_caixa, medicoNome: caixa.medico_nome },
           itens: await gabarito(q, conferencia.id, caixa.id),
         };
       });
@@ -201,11 +216,14 @@ export const cmeSalaRoutes =
       return r;
     });
 
-    /** Itens ativos da caixa, marcando os que já foram conferidos nesta conferência. */
+    /**
+     * Itens ativos da caixa, marcando os que já foram conferidos nesta conferência.
+     * O código do item NUNCA sai daqui: quem vê o código de uma peça que falta poderia digitá-lo e burlar a conferência.
+     */
     const gabarito = async (q: Queryable, conferenciaId: string, caixaId: string) =>
       (
-        await q.query<{ id: string; rotulo: string; codigo: string; conferido: boolean }>(
-          `SELECT c.id, c.rotulo, c.codigo, (ci.item_id IS NOT NULL) AS conferido
+        await q.query<{ id: string; rotulo: string; conferido: boolean }>(
+          `SELECT c.id, c.rotulo, (ci.item_id IS NOT NULL) AS conferido
              FROM cme_caixa_itens cx JOIN cme_codigos c ON c.id = cx.item_id
              LEFT JOIN cme_conferencia_itens ci ON ci.conferencia_id = $1 AND ci.item_id = c.id
             WHERE cx.caixa_id = $2 AND c.ativo ORDER BY c.rotulo, c.id`,
@@ -216,8 +234,8 @@ export const cmeSalaRoutes =
     /** Conferência aberta deste computador, travada para a leitura não contar a mesma peça duas vezes. */
     const conferenciaDaEstacao = async (q: Queryable, conferenciaId: string, estacaoId: string) =>
       (
-        await q.query<{ id: string; caixa_id: string; status: string; iniciada_em: string }>(
-          "SELECT id, caixa_id, status, iniciada_em FROM cme_conferencias WHERE id = $1 AND estacao_id = $2 FOR UPDATE",
+        await q.query<{ id: string; caixa_id: string; status: string; iniciada_em: string; setor: string }>(
+          "SELECT id, caixa_id, status, iniciada_em, setor FROM cme_conferencias WHERE id = $1 AND estacao_id = $2 FOR UPDATE",
           [conferenciaId, estacaoId],
         )
       ).rows[0];
@@ -237,7 +255,7 @@ export const cmeSalaRoutes =
           ...leituraSchema,
         })
         .parse(req.body);
-      const { tenantId, perfil } = await exigirEstacaoSala(db, req.auth.userId);
+      const { tenantId, perfil } = await exigirEstacao(db, req.auth.userId);
       await limitarTentativas(db, `cme-leitura:${perfil.id}`, 300, 60_000);
       const normalizado = normalizarLeitura(d.texto);
       if (!normalizado) throw unprocessable("Nenhum código foi recebido.");
@@ -262,7 +280,7 @@ export const cmeSalaRoutes =
         const leitura = (
           await q.query<{ id: string }>(
             `INSERT INTO cme_leituras (tenant_id, codigo_id, usuario_id, colaborador_id, origem, resultado, texto_bruto, texto_normalizado, duracao_ms, motivo, tela, ip)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'sala_conferencia', $11) RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $12, $11) RETURNING id`,
             [
               tenantId,
               codigo?.id ?? null,
@@ -275,6 +293,7 @@ export const cmeSalaRoutes =
               d.duracaoMs ?? null,
               d.motivo ?? null,
               req.ip,
+              `${conf.setor}_conferencia`,
             ],
           )
         ).rows[0]!;
@@ -300,7 +319,7 @@ export const cmeSalaRoutes =
     /** Fecha a conferência. Só com todos os itens da caixa conferidos. */
     app.post("/cme/sala/finalizar", async (req) => {
       const d = z.object({ token: z.string().min(10).max(200), conferenciaId: z.string().uuid() }).parse(req.body);
-      const { tenantId, perfil, salaId } = await exigirEstacaoSala(db, req.auth.userId);
+      const { tenantId, perfil, salaId } = await exigirEstacao(db, req.auth.userId);
       const sessao = await sessaoValida(db, perfil.id, d.token);
       return db.tx(async (q) => {
         const conf = await conferenciaDaEstacao(q, d.conferenciaId, perfil.id);
@@ -319,7 +338,7 @@ export const cmeSalaRoutes =
           usuarioId: perfil.id,
           ip: req.ip,
           acao: "cme_conferencia_concluida",
-          detalhes: { conferenciaId: conf.id, caixaId: conf.caixa_id, colaboradorId: sessao.colaborador_id, salaId, itens: itens.length },
+          detalhes: { conferenciaId: conf.id, caixaId: conf.caixa_id, colaboradorId: sessao.colaborador_id, salaId, setor: conf.setor, itens: itens.length },
         });
         return { ok: true as const, itens: itens.length, duracaoSegundos: r.rows[0]?.segundos ?? 0 };
       });

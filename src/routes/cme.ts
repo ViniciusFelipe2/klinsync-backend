@@ -347,12 +347,12 @@ export const cmeRoutes =
     });
 
     /**
-     * Define a função de um login no CME: chefe, computador de uma sala cirúrgica, ou nenhuma.
+     * Define a função de um login no CME: chefe, computador de uma sala cirúrgica, computador do CME, ou nenhuma.
      * O login precisa ser operacional e vinculado ao módulo CME.
      */
     app.post("/master/cme/funcao", async (req) => {
       const d = z
-        .object({ usuarioId: uuid, funcao: z.enum(["chefe", "estacao_sala"]).nullable(), salaId: uuid.optional() })
+        .object({ usuarioId: uuid, funcao: z.enum(["chefe", "estacao_sala", "estacao_cme"]).nullable(), salaId: uuid.optional() })
         .parse(req.body);
       const master = await exigirMaster(db, req.auth.userId);
       await db.tx(async (q) => {
@@ -382,12 +382,19 @@ export const cmeRoutes =
         } else {
           await q.query("DELETE FROM cme_contas WHERE usuario_id = $1", [d.usuarioId]);
         }
-        // Trocar a função de um computador de sala derruba quem estava logado nele pelo crachá.
+        // Trocar a função de um computador de sala ou do CME derruba quem estava logado nele pelo crachá.
         await q.query(
           "UPDATE cme_sessoes_cracha SET encerrada_em = now(), motivo_fim = 'funcao_alterada' WHERE estacao_id = $1 AND encerrada_em IS NULL",
           [d.usuarioId],
         );
-        const acao = d.funcao === "chefe" ? "cme_chefe_definido" : d.funcao === "estacao_sala" ? "cme_estacao_definida" : "cme_funcao_removida";
+        const acao =
+          d.funcao === "chefe"
+            ? "cme_chefe_definido"
+            : d.funcao === "estacao_sala"
+              ? "cme_estacao_definida"
+              : d.funcao === "estacao_cme"
+                ? "cme_estacao_cme_definida"
+                : "cme_funcao_removida";
         await auditarCme(q, { tenantId: perfil.tenant_id, usuarioId: master.id, ip: req.ip, acao, detalhes: { usuarioId: d.usuarioId, salaId } });
         await registrarAcao(q, master.id, acao, { usuario_id: d.usuarioId, tenant_id: perfil.tenant_id, sala_id: salaId });
       });

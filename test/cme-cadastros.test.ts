@@ -117,6 +117,28 @@ describe("caixas e itens", () => {
     expect(r.caixas[0].itens[0].rotulo).toBe("Item novo");
   });
 
+  it("caixa médica exige o nome do médico e o total de itens, e os guarda", async () => {
+    const sem = await post(chefe, "/cme/caixas/criar", { rotulo: "Caixa Dr. Paulo", tipoCaixa: "medica" });
+    expect(sem.status).toBe(422);
+    expect((await post(chefe, "/cme/caixas/criar", { rotulo: "Caixa Dr. Paulo", tipoCaixa: "medica", medicoNome: "Paulo Lima" })).status).toBe(422);
+    expect((await post(chefe, "/cme/caixas/criar", { rotulo: "Caixa Dr. Paulo", tipoCaixa: "medica", totalItens: 12 })).status).toBe(422);
+    expect((await post(chefe, "/cme/caixas/criar", { rotulo: "Caixa Dr. Paulo", tipoCaixa: "medica", medicoNome: "Paulo Lima", totalItens: 0 })).status).toBe(422);
+
+    const cx = await novaCaixa(chefe, "Caixa Dr. Paulo", { tipoCaixa: "medica", medicoNome: "Paulo Lima", totalItens: 12 });
+    await novoItem(chefe, cx.id, "Afastador do Dr. Paulo");
+    const r = (await chamar(amb.app, "GET", "/cme/caixas?busca=Paulo Lima", { token: chefe })).body;
+    expect(r.caixas[0]).toMatchObject({ rotulo: "Caixa Dr. Paulo", tipo_caixa: "medica", medico_nome: "Paulo Lima", total_itens: 12 });
+    expect(r.caixas[0].itens).toHaveLength(1);
+  });
+
+  it("mudar a caixa médica para outro tipo apaga o nome do médico e o total", async () => {
+    const cx = await novaCaixa(chefe, "Caixa Dr. Ana", { tipoCaixa: "medica", medicoNome: "Ana Reis", totalItens: 5 });
+    expect((await post(chefe, "/cme/caixas/editar", { id: cx.id, rotulo: "Caixa Dr. Ana", tipoCaixa: "medica", medicoNome: "Ana Reis", totalItens: 8 })).status).toBe(200);
+    expect((await post(chefe, "/cme/caixas/editar", { id: cx.id, rotulo: "Caixa Dr. Ana", tipoCaixa: "consignada", medicoNome: "Ana Reis", totalItens: 8 })).status).toBe(200);
+    const r = (await chamar(amb.app, "GET", "/cme/caixas?busca=Caixa Dr. Ana", { token: chefe })).body;
+    expect(r.caixas[0]).toMatchObject({ tipo_caixa: "consignada", medico_nome: null, total_itens: null });
+  });
+
   it("administrador vê, mas não cadastra; outro hospital não vê", async () => {
     const cx = await novaCaixa(chefe, "Caixa Só do A");
     expect((await chamar(amb.app, "GET", "/cme/caixas", { token: adm })).body.caixas.some((c: { id: string }) => c.id === cx.id)).toBe(true);
@@ -292,6 +314,29 @@ describe("conferência da caixa na sala", () => {
     token = (await entrar(estacao, c.numero_cracha)).body.token;
   });
 
+  it("o gabarito nunca entrega o código das peças nem o da caixa", async () => {
+    // Caixa própria deste teste: conferir peças aqui não pode mexer nas caixas dos outros testes.
+    const cx = await novaCaixa(chefe, "Caixa Sem Vazamento");
+    const p1 = await novoItem(chefe, cx.id, "Peça Visível 1");
+    const p2 = await novoItem(chefe, cx.id, "Peça Visível 2");
+    const r = await abrir(cx.codigo);
+    expect(r.status).toBe(200);
+    const texto = JSON.stringify(r.body);
+    for (const c of [cx.codigo, p1.codigo, p2.codigo]) expect(texto).not.toContain(c);
+    expect(r.body.caixa).not.toHaveProperty("codigo");
+    for (const i of r.body.itens) expect(i).not.toHaveProperty("codigo");
+    const conferido = await bipar(r.body.conferenciaId, p1.codigo);
+    expect(conferido.status).toBe(200);
+    expect(JSON.stringify(conferido.body)).not.toContain(p1.codigo);
+    expect(JSON.stringify(conferido.body)).not.toContain(p2.codigo);
+  });
+
+  it("na sala a caixa médica traz o nome do médico", async () => {
+    const cx = await novaCaixa(chefe, "Caixa Dr. Sala", { tipoCaixa: "medica", medicoNome: "Carlos Dias", totalItens: 3 });
+    const r = await abrir(cx.codigo);
+    expect(r.body.caixa).toMatchObject({ tipoCaixa: "medica", medicoNome: "Carlos Dias" });
+  });
+
   it("bipar a caixa abre a conferência com o gabarito, nada conferido", async () => {
     const r = await abrir(caixa.codigo);
     expect(r.status).toBe(200);
@@ -325,10 +370,10 @@ describe("conferência da caixa na sala", () => {
     const r = await amb.db.query<{ resultado: string; n: number }>(
       "SELECT resultado, count(*)::int AS n FROM cme_leituras WHERE tela = 'sala_conferencia' GROUP BY resultado ORDER BY resultado",
     );
-    // 1 conferido + 1 repetido + 1 de outra caixa + 1 código de caixa = 4 reconhecidos; 1 desconhecido.
+    // 1 conferido + 1 repetido + 1 de outra caixa + 1 código de caixa + 1 do teste de gabarito sem código = 5 reconhecidos; 1 desconhecido.
     expect(r.rows).toEqual([
       { resultado: "desconhecido", n: 1 },
-      { resultado: "reconhecido", n: 4 },
+      { resultado: "reconhecido", n: 5 },
     ]);
     const semColaborador = await amb.db.query("SELECT 1 FROM cme_leituras WHERE tela = 'sala_conferencia' AND colaborador_id IS NULL");
     expect(semColaborador.rowCount).toBe(0);
