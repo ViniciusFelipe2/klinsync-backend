@@ -112,7 +112,7 @@ describe("importação do Supabase", () => {
     expect(rel.tabelas["usuarios"]!.importadas).toBe(6); // o apagado (deleted_at) não entra
     expect(await contar(destino, "tenants")).toBe(0);
     expect(await contar(destino, "usuarios")).toBe(0);
-    expect((await destino.query<{ n: number }>("SELECT count(*)::int AS n FROM features")).rows[0]!.n).toBe(2); // seed intacto após o rollback
+    expect((await destino.query<{ n: number }>("SELECT count(*)::int AS n FROM features")).rows[0]!.n).toBe(3); // seed intacto após o rollback
   });
 
   it("importa todas as tabelas, ignora órfãos e relata avisos", async () => {

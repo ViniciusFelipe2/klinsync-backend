@@ -22,6 +22,7 @@ Navegador ──HTTPS──▶ Nginx (EC2 backend) ──▶ PM2 (cluster) ─�
 | Hospital | `/hospital/*` | Resumo, check-ins, giro, paradas, estatísticas, salas, acessos |
 | Check-in | `/checkins/*` | Fotos em **S3 privado** (URL assinada curta), valida a assinatura do arquivo |
 | Giro de sala | `/giro/*` | Etapas com regras no servidor, paradas, vínculo sala↔tablet |
+| CME | `/cme/*`, `/master/cme/*` | Data Matrix (`bwip-js`), limites do leitor por hospital, teste de leitura, falhas, auditoria só de inclusão. Fase 1 de 4 |
 | Saúde | `GET /health` | Usado pelo `deploy.sh` (rollback automático se falhar) |
 
 Regras transversais: todo acesso é filtrado pelo **hospital do token** (nunca por parâmetro do cliente); perfil inativo equivale a sessão inválida;
@@ -55,6 +56,11 @@ npm run sync-schema # copia ../klinsync-db/migrations para test/db/ (rode ao mud
 ```
 
 Os testes não dependem de rede, S3 nem de um Postgres instalado. `test/db/` espelha as migrations do `klinsync-db`.
+
+## Módulo CME: como testar localmente
+
+`npm run local:dev` aplica a migration nova sozinho. Depois: habilite o módulo **CME** no hospital (painel master → features), crie um login operacional vinculado a ele e clique em **Tornar chefe do CME**.
+O módulo não tem variável de ambiente nova: o tamanho padrão e os limites do leitor ficam na tela **CME → Configuração**, por hospital. Roteiro completo: [`klinsync-frontend/docs/CME-TESTE-HOSPITAL.md`](../klinsync-frontend/docs/CME-TESTE-HOSPITAL.md).
 
 ## Testando tudo localmente (sem EC2)
 

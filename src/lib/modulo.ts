@@ -2,7 +2,7 @@ import type { Queryable } from "../db/index.js";
 import { forbidden } from "../errors.js";
 import { escopoTenant, type Perfil } from "./perfil.js";
 
-export type ChaveModulo = "checkin_cirurgioes" | "giro_de_sala";
+export type ChaveModulo = "checkin_cirurgioes" | "giro_de_sala" | "cme";
 
 /**
  * Mesma regra de `/modulos/acesso`, aplicada em cada rota do módulo (e não só na tela):

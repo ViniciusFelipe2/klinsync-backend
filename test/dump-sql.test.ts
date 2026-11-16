@@ -66,5 +66,6 @@ describe("dump SQL dos dados importados", () => {
     expect((await destino.query<{ m: number }>("SELECT max_tentativas AS m FROM config_seguranca")).rows[0]!.m).toBe(9);
 
     await Promise.all([origem.close(), staging.close(), pgStaging.close(), destino.close()]);
-  });
+    // Abre quatro bancos embutidos: com a suíte inteira rodando em paralelo, passa dos 30 s padrão.
+  }, 90_000);
 });

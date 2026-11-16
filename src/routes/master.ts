@@ -121,7 +121,12 @@ export const masterRoutes =
       if (normalizar(d.confirmarNome) !== normalizar(hospital.nome)) throw unprocessable("O nome digitado não confere com o do hospital.");
 
       const fotos = await db.tx(async (q) => {
-        const caminhos = (await q.query<{ photo_path: string }>("SELECT photo_path FROM check_ins WHERE tenant_id = $1", [d.id])).rows.map(
+        const rastreabilidade = await q.query(
+          "SELECT 1 FROM cme_codigos WHERE tenant_id = $1 UNION ALL SELECT 1 FROM cme_leituras WHERE tenant_id = $1 UNION ALL SELECT 1 FROM cme_colaboradores WHERE tenant_id = $1 LIMIT 1",
+          [d.id],
+        );
+        if (rastreabilidade.rowCount > 0) throw conflict("Este hospital tem registros de rastreabilidade do CME e não pode ser excluído.");
+        const caminhos =(await q.query<{ photo_path: string }>("SELECT photo_path FROM check_ins WHERE tenant_id = $1", [d.id])).rows.map(
           (x) => x.photo_path,
         );
         const usuarios = (await q.query<{ id: string }>("SELECT id FROM usuarios_perfil WHERE tenant_id = $1", [d.id])).rows.map((x) => x.id);

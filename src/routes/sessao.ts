@@ -8,6 +8,7 @@ type FeatureLinha = { id: string; chave: string; nome_exibicao: string };
 const ROTAS_POR_FEATURE: Record<string, string> = {
   checkin_cirurgioes: "/check-in",
   giro_de_sala: "/giro-sala",
+  cme: "/cme",
 };
 
 export const sessaoRoutes =

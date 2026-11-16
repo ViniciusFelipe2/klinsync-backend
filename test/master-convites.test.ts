@@ -77,7 +77,7 @@ describe("hospitais, módulos e dashboard (master)", () => {
     const dash = await chamar(amb.app, "GET", "/master/dashboard", { token: master });
     expect(dash.status).toBe(200);
     expect(dash.body.tenants.length).toBeGreaterThanOrEqual(3);
-    expect(dash.body.features).toHaveLength(2);
+    expect(dash.body.features).toHaveLength(3);
 
     const aud = await chamar(amb.app, "POST", "/auditoria", { token: master, body: { dias: 30 } });
     const titulos = aud.body.eventos.map((e: { titulo: string }) => e.titulo);
